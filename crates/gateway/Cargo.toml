@@ -1,0 +1,24 @@
+[package]
+name = "gateway"
+description = "Order gateway: TCP sessions, configuration, batched I/O, socket tuning, exchange v2 pipeline."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+types = { workspace = true }
+sync = { workspace = true }
+telemetry = { workspace = true }
+engine = { workspace = true }
+journal = { workspace = true }
+marketdata = { workspace = true }
+wire = { workspace = true }
+fix = { workspace = true }
+risk = { workspace = true }
+
+[dev-dependencies]
+benchkit = { workspace = true }
+
+[[bench]]
+name = "hft"
+harness = false

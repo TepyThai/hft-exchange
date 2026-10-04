@@ -1,0 +1,9 @@
+[package]
+name = "xtask"
+description = "Workspace tasks: week-scoped tests and benchmarks, reports for tepy.dev, template generation."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]

@@ -1,0 +1,16 @@
+[package]
+name = "book"
+description = "Limit order book: price levels, FIFO queues, O(1) cancel; slab and ladder variants."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+types = { workspace = true }
+
+[dev-dependencies]
+benchkit = { workspace = true }
+
+[[bench]]
+name = "hft"
+harness = false

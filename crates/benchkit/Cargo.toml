@@ -1,0 +1,8 @@
+[package]
+name = "benchkit"
+description = "Measurement harness for hft-exchange benchmarks (not student code)."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]

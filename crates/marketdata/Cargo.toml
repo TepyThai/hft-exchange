@@ -1,0 +1,16 @@
+[package]
+name = "marketdata"
+description = "Market data: L2 incrementals and snapshots, client book builder with gap recovery, fan-out, SIMD aggregation, capture replay."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+types = { workspace = true }
+
+[dev-dependencies]
+benchkit = { workspace = true }
+
+[[bench]]
+name = "hft"
+harness = false

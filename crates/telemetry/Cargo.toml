@@ -1,0 +1,16 @@
+[package]
+name = "telemetry"
+description = "Measurement: latency histograms, per-thread metrics, clocks, open-loop load harness, stage attribution."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+
+
+[dev-dependencies]
+benchkit = { workspace = true }
+
+[[bench]]
+name = "hft"
+harness = false

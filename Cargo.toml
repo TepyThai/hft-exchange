@@ -1,0 +1,43 @@
+[workspace]
+resolver = "2"
+members = ["crates/*", "xtask"]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+license = "MIT"
+repository = "https://github.com/TepyThai/hft-exchange"
+rust-version = "1.80"
+
+[workspace.dependencies]
+types = { path = "crates/types" }
+benchkit = { path = "crates/benchkit" }
+sync = { path = "crates/sync" }
+telemetry = { path = "crates/telemetry" }
+book = { path = "crates/book" }
+engine = { path = "crates/engine" }
+journal = { path = "crates/journal" }
+marketdata = { path = "crates/marketdata" }
+wire = { path = "crates/wire" }
+fix = { path = "crates/fix" }
+risk = { path = "crates/risk" }
+gateway = { path = "crates/gateway" }
+sim = { path = "crates/sim" }
+
+# Latency work wants the whole program optimized together and readable
+# profiles (line tables) without slowing anything down.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+debug = "line-tables-only"
+
+[profile.bench]
+inherits = "release"
+
+# `cargo xtask test` builds tests optimized (timing-sensitive tests need
+# it) but without fat LTO, which would make every test binary slow to link.
+[profile.xtest]
+inherits = "release"
+lto = false
+codegen-units = 16
+debug = false

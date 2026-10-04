@@ -1,0 +1,19 @@
+[package]
+name = "engine"
+description = "Matching engine: price-time priority, order types, validation, property tests, sharding, specialization."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+types = { workspace = true }
+book = { workspace = true }
+journal = { workspace = true }
+marketdata = { workspace = true }
+
+[dev-dependencies]
+benchkit = { workspace = true }
+
+[[bench]]
+name = "hft"
+harness = false

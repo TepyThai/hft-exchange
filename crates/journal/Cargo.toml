@@ -1,0 +1,16 @@
+[package]
+name = "journal"
+description = "Sequenced append-only journal, replay, snapshots, recovery and replication."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+types = { workspace = true }
+
+[dev-dependencies]
+benchkit = { workspace = true }
+
+[[bench]]
+name = "hft"
+harness = false

@@ -1,0 +1,19 @@
+[package]
+name = "sim"
+description = "Simulation: traders, scenarios, microstructure analytics, strategies, backtesting, fault injection."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+types = { workspace = true }
+engine = { workspace = true }
+marketdata = { workspace = true }
+risk = { workspace = true }
+
+[dev-dependencies]
+benchkit = { workspace = true }
+
+[[bench]]
+name = "hft"
+harness = false
