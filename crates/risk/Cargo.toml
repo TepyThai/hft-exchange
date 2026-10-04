@@ -1,0 +1,16 @@
+[package]
+name = "risk"
+description = "Pre-trade risk checks, throttles, positions and PnL."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+types = { workspace = true }
+
+[dev-dependencies]
+benchkit = { workspace = true }
+
+[[bench]]
+name = "hft"
+harness = false

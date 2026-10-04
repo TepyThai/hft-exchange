@@ -1,0 +1,11 @@
+# Keep the build context small and the image reproducible: no local build
+# output, no VCS metadata, no reports, no native terminal app. The images
+# pin their own toolchain, so rust-toolchain.toml stays out too.
+target
+**/target
+.git
+hft-report.json
+apps
+rust-toolchain.toml
+**/*.swp
+.DS_Store

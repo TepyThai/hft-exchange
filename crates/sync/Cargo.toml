@@ -1,0 +1,16 @@
+[package]
+name = "sync"
+description = "Concurrency primitives: channels, ring buffers, MPSC queues, cache padding, cancellation, task sets, wait strategies, seqlocks."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+
+
+[dev-dependencies]
+benchkit = { workspace = true }
+
+[[bench]]
+name = "hft"
+harness = false

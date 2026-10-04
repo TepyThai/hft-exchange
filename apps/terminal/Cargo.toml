@@ -1,0 +1,21 @@
+[package]
+name = "hft-terminal"
+description = "Native trading terminal for hft-exchange (GPUI): order book, candles, depth, latency, order entry."
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+# A separate workspace: GPUI is a large dependency the curriculum crates and
+# CI never need. Build with `cargo run --release` from this directory.
+[workspace]
+
+[dependencies]
+gpui-kit = "0.7"
+types = { path = "../../crates/types" }
+engine = { path = "../../crates/engine" }
+sim = { path = "../../crates/sim" }
+benchkit = { path = "../../crates/benchkit" }
+
+[profile.release]
+debug = "line-tables-only"

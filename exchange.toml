@@ -1,0 +1,73 @@
+# hft-exchange configuration (week 22).
+#
+# Validate without starting:   cargo run -p gateway --bin exchange -- --config exchange.toml --check-config
+# Print the effective config:  ... --print-config
+# Override a key per host:     HFT_GATEWAY_LISTEN=0.0.0.0:9100 HFT_JOURNAL_FSYNC=never ...
+#
+# Unknown keys are errors. Every value below except the journal path and
+# the instruments has a default; they are written out so the file is the
+# whole story.
+
+[gateway]
+listen = "0.0.0.0:9000"
+io_threads = 2                 # Tokio workers; leave a core for the engine
+inbound_capacity = 4096        # sessions -> engine queue (power of two)
+outbound_capacity = 4096       # reports per session before "slow consumer"
+read_buffer = 16_384
+logon_timeout_ms = 5_000
+cancel_on_disconnect = true
+send_buffer = 65_536           # SO_SNDBUF request (the kernel doubles it); 0 = default
+recv_buffer = 131_072          # SO_RCVBUF request
+vectored_writes = false
+busy_reject = true             # week 24: a full engine queue answers new orders "busy"
+
+[engine]
+# cpu = 3                      # pin the engine thread (uncomment on a tuned host)
+busy_poll = true
+
+[risk]
+max_order_qty = 100_000        # lots
+max_notional = 1_000_000_000   # ticks x lots
+max_position = 1_000_000       # lots per instrument
+price_band_ticks = 0           # 0 = off (the engine also has per-instrument bands)
+
+[throttle]
+session_rate = 5_000           # orders per second per session
+session_burst = 100
+account_rate = 20_000          # per account, all its sessions together
+account_burst = 400
+
+[journal]
+path = "/var/lib/hft/journal.bin" # one file per instrument: journal.1.bin, journal.2.bin, ...
+fsync = "always"               # always | never | interval:<ms>
+
+[marketdata]
+depth = 10
+snapshot_interval = 1_000
+subscriber_queue = 4_096
+conflate = true
+listen = "0.0.0.0:9001"        # WebSocket feed: instrument 1 on 9001, instrument 2 on 9002
+
+[[instrument]]
+id = 1
+symbol = "BTC-USD"
+tick = 1                       # price grid, in ticks
+lot = 1
+band_ticks = 5_000
+reference_price = 6_000_000
+
+[[instrument]]
+id = 2
+symbol = "ETH-USD"
+tick = 5
+lot = 10
+band_ticks = 2_000
+reference_price = 300_000
+
+[[account]]
+id = 1
+token = 1001
+
+[[account]]
+id = 2
+token = 1002

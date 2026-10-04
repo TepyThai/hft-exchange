@@ -1,0 +1,16 @@
+[package]
+name = "fix"
+description = "FIX 4.4 parser/encoder and session layer."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+types = { workspace = true }
+
+[dev-dependencies]
+benchkit = { workspace = true }
+
+[[bench]]
+name = "hft"
+harness = false

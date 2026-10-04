@@ -1,0 +1,12 @@
+[package]
+name = "demo"
+description = "Demo exchange: engine + simulated order flow + WebSocket market data (Weeks 47, 51)."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+types = { workspace = true }
+sim = { workspace = true }
+marketdata = { workspace = true }
+telemetry = { workspace = true }

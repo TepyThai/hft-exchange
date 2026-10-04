@@ -1,0 +1,45 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      bench:
+        description: Also run benchmarks (noisy on shared runners)
+        type: boolean
+        default: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    env:
+      TEPY_TOKEN: ${{ secrets.TEPY_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Week tests (and optionally benchmarks) → hft-report.json, uploaded
+      # to tepy.dev when the TEPY_TOKEN secret is set. Failing week tests are
+      # progress, not a CI failure; only a build error fails the job.
+      - name: Run week tests and report
+        run: cargo xtask report --source ci ${{ inputs.bench != true && '--no-bench' || '' }} $([ -n "$TEPY_TOKEN" ] && echo --upload)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hft-report
+          path: hft-report.json
+
+  reference:
+    if: github.ref_name == 'reference'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Every test passes on the reference implementation
+        run: cargo test --workspace --profile xtest
+      - name: The generated template compiles
+        run: cargo xtask strip --out "$RUNNER_TEMP/template" --check

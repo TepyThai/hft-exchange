@@ -1,0 +1,14 @@
+[package]
+name = "engine-wasm"
+description = "WebAssembly bindings to the matching engine for the tepy.dev live demo."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+types = { workspace = true }
+engine = { workspace = true }
+sim = { workspace = true }

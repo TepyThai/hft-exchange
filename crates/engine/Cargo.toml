@@ -1,0 +1,26 @@
+[package]
+name = "engine"
+description = "Matching engine: price-time priority, order types, validation, property tests, sharding, specialization."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+types = { workspace = true }
+book = { workspace = true }
+# w12 engine v1 wiring (`pipeline`): sequence → journal → match → market
+# data; w18 recovery and w20 failover build on the journal. The matching
+# core itself uses neither.
+journal = { workspace = true }
+marketdata = { workspace = true }
+# w37: the w15 pre-trade risk engine as a `RiskPolicy`.
+risk = { workspace = true }
+
+[dev-dependencies]
+benchkit = { workspace = true }
+# w25 open-loop benchmark of the engine (telemetry::OpenLoop).
+telemetry = { workspace = true }
+
+[[bench]]
+name = "hft"
+harness = false
