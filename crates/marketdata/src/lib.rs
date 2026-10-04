@@ -29,13 +29,67 @@
 //! * A snapshot with `seq == s` is the book after update `s` (`s == 0`:
 //!   before any update). A consumer applies it, drops buffered updates
 //!   `<= s`, then needs `s + 1` next.
+//!
+//! The book by price is kept in a [`DepthBook`]: [`MapDepth`] (ordered
+//! maps) by default; both the publisher and the builder are generic over it.
+//!
+//! # Week 16 — fan-out
+//!
+//! * [`broadcast`] creates a single-writer broadcast ring ([`RingPublisher`],
+//!   [`BroadcastRing`], [`Reader`]): the writer never waits; each reader
+//!   has its own cursor and learns from [`Recv::Lagged`] exactly how much
+//!   it missed when it fell more than the capacity behind. Slots are
+//!   per-slot seqlocks over atomic words ([`RingValue`]).
+//! * [`Conflator`] keeps only the latest update per level for a slow
+//!   consumer, in first-dirty order.
+//! * [`ws`] is a std-only WebSocket adapter (RFC 6455 handshake with
+//!   in-crate SHA-1/base64, framing) and [`serve_ws`] streams a snapshot
+//!   then conflated update batches ([`json`]) to each browser.
+//!
+//! # Week 29 — SIMD
+//!
+//! [`LadderDepth`] is a [`DepthBook`] of dense quantity arrays around the
+//! touch, best level first on both sides, so depth aggregation and level
+//! search become forward scans that [`Kernels`] vectorize (AVX2 with
+//! runtime detection, chosen once; a scalar fallback with identical
+//! results).
+//!
+//! # Week 46 — replay from captures
+//!
+//! * [`feed`] defines the binary packet layout of the feed (sequenced
+//!   incremental packets, snapshot packets).
+//! * [`pcap`] writes and reads libpcap captures of Ethernet/IPv4/UDP
+//!   frames carrying those packets.
+//! * [`ReorderBuffer`] restores sequence order (late packets buffered,
+//!   duplicates dropped, holes given up after a window).
+//! * [`Replayer`] / [`replay_capture`] rebuild the book with a
+//!   [`BookBuilder`], recover from gaps with recorded snapshots and verify
+//!   the book against them.
 
 pub mod builder;
-mod depth;
+pub mod conflate;
+pub mod depth;
+pub mod feed;
+pub mod json;
+pub mod ladder;
+pub mod pcap;
 pub mod publisher;
+pub mod reorder;
+pub mod replay;
+pub mod ring;
+pub mod simd;
+pub mod ws;
 
 pub use builder::{BookBuilder, SnapshotOutcome, UpdateOutcome};
+pub use conflate::Conflator;
+pub use depth::{DepthBook, MapDepth};
+pub use ladder::LadderDepth;
 pub use publisher::L2Publisher;
+pub use reorder::{PushOutcome, ReorderBuffer};
+pub use replay::{replay_capture, FeedRecorder, ReplayStats, Replayer};
+pub use ring::{broadcast, BroadcastRing, Reader, Recv, RingPublisher, RingValue};
+pub use simd::Kernels;
+pub use ws::{serve_ws, serve_ws_client, SnapshotCell};
 
 use types::{Price, Qty, Seq, Side};
 
