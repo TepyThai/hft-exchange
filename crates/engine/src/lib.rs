@@ -95,17 +95,32 @@
 //! * w08 — [`Engine::validate`], [`Engine::fillable`]: TIF, post-only,
 //!   tick/lot/band validation.
 //! * w12 — [`testkit`]: order-stream generator, invariant checker, naive
-//!   reference matcher, differential testing and shrinking.
+//!   reference matcher, differential testing and shrinking. [`pipeline`]:
+//!   engine v1, [`Pipeline`] = sequencer (journal append) → engine →
+//!   L2 market data, and the engine as a [`journal::StateMachine`].
+//! * w18 — [`EngineState`], [`Engine::snapshot_state`] /
+//!   [`Engine::restore`], the engine as a [`journal::Snapshottable`];
+//!   [`recover`] and [`Pipeline::checkpoint`] over a
+//!   [`journal::FileJournal`].
+//! * w20 — failover: a [`Pipeline`] sequencing through a
+//!   [`journal::Primary`], with a [`journal::Standby`] applying the stream
+//!   to its own engine (see the journal crate).
 
+mod durable;
 mod engine;
 mod hash;
+pub mod pipeline;
 mod snapshot;
+mod state;
 mod tape;
 pub mod testkit;
 
+pub use durable::{recover, CheckpointError, DurablePipeline};
 pub use engine::{Engine, EngineConfig};
 pub use hash::StateHasher;
+pub use pipeline::{Output, Pipeline, SeqMismatch};
 pub use snapshot::BookSnapshot;
+pub use state::{EngineState, RestoreError, StateError};
 pub use tape::{TradePrint, TradeTape};
 
 pub use book::{Book, LevelInfo, OrderBook, RestingOrder};

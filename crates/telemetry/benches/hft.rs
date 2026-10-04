@@ -2,13 +2,10 @@
 
 use benchkit::{black_box, latency_batched, Report, Unit};
 use telemetry::{
-    Attribution, Clock, Histogram, OpenLoop, Registry, Stage, StageStamps, TimeSource,
-    LATENCY_BOUNDS_NS,
+    Attribution, Clock, Histogram, Registry, Stage, StageStamps, TimeSource, LATENCY_BOUNDS_NS,
 };
 use types::Rng;
 
-const W25_LABEL: &str = "Synthetic service (200ns + 50us stall every 10k) at 1M req/s open-loop, \
-     response from intended start (engine stand-in)";
 const W39_LABEL: &str = "Order in -> ack, in-process pipeline (synthetic 4 stages, ~600ns of work)";
 
 fn main() {
@@ -24,7 +21,6 @@ fn main() {
             bench_metric_overhead,
         ),
         ("w21.clock_now", "Clock::now cost", bench_clock_now),
-        ("w25.engine_open_loop", W25_LABEL, bench_engine_open_loop),
         ("w39.tick_to_ack", W39_LABEL, bench_tick_to_ack),
     ]);
 }
@@ -130,34 +126,10 @@ fn bench_clock_now() -> Report {
 }
 
 // --- Week 25 ----------------------------------------------------------------
-
-/// Open-loop load at 1M req/s against a synthetic service: a ~200 ns
-/// busy-wait, with a 50 µs stall on every 10,000th request. Reported
-/// latencies are response times from each request's *intended* start, so
-/// the requests queued behind a stall are charged for it (the p99.9 shows
-/// it; a closed-loop measurement would hide it).
-///
-/// The engine crate is integrated later: the gateway/engine work re-points
-/// this benchmark at the real engine (same id).
-fn bench_engine_open_loop() -> Report {
-    let mut clock = Clock::new();
-    let schedule = OpenLoop::at_rate(1_000_000, 1_000_000).with_warmup(50_000);
-    let r = schedule.run(&mut clock, |c, i| {
-        let cost = if i % 10_000 == 9_999 { 50_000 } else { 200 };
-        let until = c.now() + cost;
-        c.wait_until(until);
-    });
-    eprintln!(
-        "offered {:.0}/s, achieved {:.0}/s, max lag {} ns; closed-loop view (service time): p50 {} p99 {} p99.9 {} ns",
-        r.offered_rate(),
-        r.achieved_rate(),
-        r.max_lag_ns,
-        r.service.percentile(0.5),
-        r.service.percentile(0.99),
-        r.service.percentile(0.999)
-    );
-    report("w25.engine_open_loop", W25_LABEL, &r.response)
-}
+//
+// `w25.engine_open_loop` measures the real engine under `OpenLoop`, so it
+// lives in the engine crate's benches (telemetry cannot depend on the
+// engine).
 
 // --- Week 39 ----------------------------------------------------------------
 

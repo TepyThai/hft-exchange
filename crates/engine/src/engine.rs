@@ -385,3 +385,7 @@ impl<B: OrderBook> Engine<B> {
         got.min(want)
     }
 }
+
+// w18 snapshot / restore: a child module, because a restore sets the
+// private fields above (`engine/restore.rs`).
+mod restore;

@@ -8,11 +8,16 @@ license.workspace = true
 [dependencies]
 types = { workspace = true }
 book = { workspace = true }
-# `journal` and `marketdata` join in w12 (engine v1 wiring); they are not
-# used by the matching core.
+# w12 engine v1 wiring (`pipeline`): sequence → journal → match → market
+# data; w18 recovery and w20 failover build on the journal. The matching
+# core itself uses neither.
+journal = { workspace = true }
+marketdata = { workspace = true }
 
 [dev-dependencies]
 benchkit = { workspace = true }
+# w25 open-loop benchmark of the engine (telemetry::OpenLoop).
+telemetry = { workspace = true }
 
 [[bench]]
 name = "hft"
