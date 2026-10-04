@@ -239,7 +239,7 @@ fn summarize_bench(json: &str) -> String {
 // ---------------------------------------------------------------------------
 // Report
 
-fn workspace_root() -> std::path::PathBuf {
+pub fn workspace_root() -> std::path::PathBuf {
     let here = std::env::var("CARGO_MANIFEST_DIR").map(std::path::PathBuf::from).unwrap_or_else(|_| ".".into());
     here.parent().map(|p| p.to_path_buf()).unwrap_or(here)
 }

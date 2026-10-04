@@ -4,7 +4,8 @@
 //! value that random-walks with mean reversion: mostly passive limit orders
 //! near the touch, some aggressive limits, IOC and market orders, and
 //! cancels of its own resting orders. Feed every engine event back through
-//! [`OrderFlow::on_event`] so cancels only target orders that still rest.
+//! [`OrderFlow::on_event`] so cancels only target orders that still rest
+//! (it follows rests, fills, reductions, cancels and expiries).
 //!
 //! It is infrastructure, not a curriculum exercise: deterministic for a
 //! seed, no allocation per command once warmed up, no clock.
@@ -65,8 +66,8 @@ pub struct OrderFlow {
     rng: Rng,
     fair: f64,
     next_id: u64,
-    /// Resting orders this flow owns: id -> index in `resting_ids`.
-    resting: HashMap<u64, usize>,
+    /// Resting orders this flow owns: id -> (index in `resting_ids`, open qty).
+    resting: HashMap<u64, (usize, u64)>,
     resting_ids: Vec<u64>,
 }
 
@@ -116,30 +117,39 @@ impl OrderFlow {
     /// Track resting orders from engine events (all events, any owner).
     pub fn on_event(&mut self, event: &Event) {
         match *event {
-            Event::Rested { id, .. } if self.owns(id) => {
+            Event::Rested { id, qty, .. } if self.owns(id) => {
                 if !self.resting.contains_key(&id.0) {
-                    self.resting.insert(id.0, self.resting_ids.len());
+                    self.resting.insert(id.0, (self.resting_ids.len(), qty.0));
                     self.resting_ids.push(id.0);
                 }
             }
+            Event::Trade { maker, qty, .. } => {
+                if let Some(entry) = self.resting.get_mut(&maker.0) {
+                    entry.1 = entry.1.saturating_sub(qty.0);
+                    if entry.1 == 0 {
+                        self.forget(maker.0);
+                    }
+                }
+            }
             Event::Cancelled { id, .. } | Event::Expired { id, .. } => self.forget(id.0),
-            Event::Reduced { id, remaining } if remaining.0 == 0 => self.forget(id.0),
+            Event::Reduced { id, remaining } => {
+                if remaining.0 == 0 {
+                    self.forget(id.0);
+                } else if let Some(entry) = self.resting.get_mut(&id.0) {
+                    entry.1 = remaining.0;
+                }
+            }
             _ => {}
         }
     }
 
-    /// A maker was fully filled: callers that see fills (book snapshots,
-    /// L2 deltas) can report it so cancels stop targeting it. Cancelling a
-    /// filled order is harmless (the engine rejects it), only wasteful.
-    pub fn on_filled(&mut self, id: OrderId) {
-        self.forget(id.0);
-    }
-
     fn forget(&mut self, id: u64) {
-        if let Some(i) = self.resting.remove(&id) {
+        if let Some((i, _)) = self.resting.remove(&id) {
             self.resting_ids.swap_remove(i);
             if let Some(&moved) = self.resting_ids.get(i) {
-                self.resting.insert(moved, i);
+                if let Some(entry) = self.resting.get_mut(&moved) {
+                    entry.0 = i;
+                }
             }
         }
     }
@@ -227,6 +237,26 @@ mod tests {
             }
         }
         assert!(a.resting() > 0);
+    }
+
+    #[test]
+    fn fully_filled_makers_are_not_cancelled() {
+        let mut f = OrderFlow::new(FlowConfig { p_cancel: 1.0, ..FlowConfig::default() }, 9);
+        let Command::New(o) = f.next_command() else { panic!("first command must be new") };
+        let p = o.limit_price().unwrap_or(types::Price(10_000));
+        f.on_event(&Event::Rested { id: o.id, side: o.side, price: p, qty: o.qty });
+        assert_eq!(f.resting(), 1);
+        let half = types::Qty(o.qty.0 / 2);
+        f.on_event(&Event::Trade { taker: OrderId(999_999), maker: o.id, taker_side: o.side.opposite(), price: p, qty: half });
+        assert_eq!(f.resting(), if half.0 == o.qty.0 { 0 } else { 1 });
+        f.on_event(&Event::Trade {
+            taker: OrderId(999_998),
+            maker: o.id,
+            taker_side: o.side.opposite(),
+            price: p,
+            qty: types::Qty(o.qty.0 - half.0),
+        });
+        assert_eq!(f.resting(), 0);
     }
 
     #[test]

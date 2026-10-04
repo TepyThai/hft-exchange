@@ -5,6 +5,7 @@
 //! cargo xtask bench  [--week N | --upto N] [FILTER]   benchmarks (ids start with wNN.)
 //! cargo xtask report [--upto N] [--no-bench] [--upload] [--token T] [--endpoint URL] [--source ci|local]
 //! cargo xtask strip  --out DIR [--check]              generate the learner template from the reference
+//! cargo xtask wasm   [--out PATH]                      build the engine for the browser (tepy.dev/hft/live)
 //! ```
 //!
 //! Reports are JSON (schema 1) written to `hft-report.json`; `--upload`
@@ -14,6 +15,7 @@
 
 mod report;
 mod strip;
+mod wasm;
 
 use std::process::ExitCode;
 
@@ -100,13 +102,14 @@ fn parse_week(v: &str) -> Result<u32, String> {
     Ok(n)
 }
 
-const USAGE: &str = "usage: cargo xtask <test|bench|report|strip> [--week N | --upto N] [options]
+const USAGE: &str = "usage: cargo xtask <test|bench|report|strip|wasm> [--week N | --upto N] [options]
   test    run week-scoped tests (names start with wNN_)
   bench   run benchmarks (ids start with wNN.) — optional substring FILTER
   report  tests + benchmarks → hft-report.json; --upload sends it to tepy.dev
           (--token or TEPY_TOKEN, --endpoint, --source ci|local, --no-bench)
   strip   --out DIR [--check]: generate the learner template (bodies of
-          `// @student wNN` items become todo!()); --check also builds it";
+          `// @student wNN` items become todo!()); --check also builds it
+  wasm    [--out PATH]: build crates/wasm for the browser → target/wasm/hft-engine.wasm";
 
 fn main() -> ExitCode {
     let raw: Vec<String> = std::env::args().skip(1).collect();
@@ -126,6 +129,7 @@ fn main() -> ExitCode {
         "bench" => report::cmd_bench(&args),
         "report" => report::cmd_report(&args),
         "strip" => strip::cmd_strip(&args),
+        "wasm" => wasm::cmd_wasm(&args),
         "-h" | "--help" | "help" => {
             println!("{USAGE}");
             Ok(true)
