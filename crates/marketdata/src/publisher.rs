@@ -22,11 +22,10 @@
 //! remaining)` — next to the L2 depth it publishes. It is the same
 //! information a consumer of a by-order (L3) feed would have to keep.
 
-use crate::{L2Snapshot, L2Update, Level};
+use crate::{DepthBook, L2Snapshot, L2Update, Level, MapDepth};
 use types::{Event, OrderId, Price, Qty, Seq, Side};
 
 // @student-begin w10
-use crate::depth::Depth;
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
 
@@ -71,13 +70,17 @@ type OrderMap = HashMap<OrderId, RestingOrder, BuildHasherDefault<IdHasher>>;
 /// Feed it every event the engine emits for the instrument, in order, from
 /// the start (it cannot see orders that rested before it was created).
 /// Memory is O(resting orders + price levels).
+///
+/// Generic over the depth representation `D` (week 29), like
+/// [`BookBuilder`](crate::BookBuilder); see
+/// [`with_depth`](L2Publisher::with_depth).
 // @student w10
 #[derive(Clone, Debug)]
-pub struct L2Publisher {
+pub struct L2Publisher<D = MapDepth> {
     /// L3 view: every resting order.
     orders: OrderMap,
     /// L2 view: aggregate quantity per level.
-    depth: Depth,
+    depth: D,
     /// Sequence number of the last update emitted (0 = none yet).
     last_seq: Seq,
     /// Emit a periodic snapshot every this many updates (0 = never).
@@ -88,22 +91,38 @@ pub struct L2Publisher {
 
 // @student w10
 impl L2Publisher {
-    /// An empty book with no periodic snapshots.
+    /// An empty [`MapDepth`] book with no periodic snapshots.
     pub fn new() -> L2Publisher {
         L2Publisher::with_snapshot_interval(0)
     }
 
-    /// An empty book that offers a full snapshot through
+    /// An empty [`MapDepth`] book that offers a full snapshot through
     /// [`periodic_snapshot`](L2Publisher::periodic_snapshot) every
     /// `updates` updates (0 = never).
     pub fn with_snapshot_interval(updates: u64) -> L2Publisher {
+        L2Publisher::with_depth(MapDepth::default(), updates)
+    }
+}
+
+// @student w10
+impl<D: DepthBook> L2Publisher<D> {
+    /// An empty book kept in `depth` (cleared first), with a periodic
+    /// snapshot every `snapshot_interval` updates (0 = never).
+    pub fn with_depth(depth: D, snapshot_interval: u64) -> L2Publisher<D> {
+        let mut depth = depth;
+        depth.load(&L2Snapshot::default());
         L2Publisher {
             orders: OrderMap::default(),
-            depth: Depth::default(),
+            depth,
             last_seq: Seq(0),
-            snapshot_interval: updates,
+            snapshot_interval,
             last_snapshot_seq: Seq(0),
         }
+    }
+
+    /// The depth the book is kept in.
+    pub fn depth_book(&self) -> &D {
+        &self.depth
     }
 
     /// Applies one engine event and returns the level change it causes, if
@@ -112,8 +131,9 @@ impl L2Publisher {
     /// level; `Accepted`, `Rejected` and `Expired` of an order that never
     /// rested change none. Events about unknown orders are ignored.
     ///
-    /// O(1) expected for the order lookup plus O(log levels) for the level;
-    /// allocates only when a new order or level needs room.
+    /// O(1) expected for the order lookup plus one [`DepthBook`] operation
+    /// for the level (O(log levels) with [`MapDepth`]); allocates only when
+    /// a new order or level needs room.
     #[inline]
     pub fn on_event(&mut self, ev: &Event) -> Option<L2Update> {
         let (side, price, qty) = match *ev {
@@ -212,17 +232,18 @@ impl L2Publisher {
         Some(self.snapshot())
     }
 
-    /// Aggregate quantity at one level (zero if absent). O(log levels).
+    /// Aggregate quantity at one level (zero if absent). O(log levels)
+    /// with [`MapDepth`].
     pub fn level_qty(&self, side: Side, price: Price) -> Qty {
         self.depth.get(side, price)
     }
 
-    /// Highest bid level. O(log levels).
+    /// Highest bid level. O(log levels) with [`MapDepth`].
     pub fn best_bid(&self) -> Option<Level> {
         self.depth.best(Side::Buy)
     }
 
-    /// Lowest ask level. O(log levels).
+    /// Lowest ask level. O(log levels) with [`MapDepth`].
     pub fn best_ask(&self) -> Option<Level> {
         self.depth.best(Side::Sell)
     }

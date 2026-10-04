@@ -19,12 +19,8 @@
 //! and duplicates (A/B feed arbitration delivers both). Reordering is week
 //! 46's reorder buffer.
 
-use crate::{L2Snapshot, L2Update, Level};
+use crate::{DepthBook, L2Snapshot, L2Update, Level, MapDepth};
 use types::{Price, Qty, Seq, Side};
-
-// @student-begin w10
-use crate::depth::Depth;
-// @student-end
 
 /// What [`BookBuilder::apply_update`] did with an update.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -69,10 +65,15 @@ pub enum SnapshotOutcome {
 /// `L2Snapshot::default()`, the empty book at `Seq(0)`). While out of
 /// sync, the query methods return the last known — stale — book; check
 /// [`is_synced`](BookBuilder::is_synced).
+///
+/// Generic over the depth representation `D` (week 29): the default
+/// [`MapDepth`] works for any price; [`LadderDepth`](crate::LadderDepth)
+/// trades memory for dense, vectorizable arrays (see
+/// [`with_depth`](BookBuilder::with_depth)).
 // @student w10
-#[derive(Clone, Debug, Default)]
-pub struct BookBuilder {
-    depth: Depth,
+#[derive(Clone, Debug)]
+pub struct BookBuilder<D = MapDepth> {
+    depth: D,
     /// Feed sequence number the book reflects; `None` before any snapshot.
     seq: Option<Seq>,
     synced: bool,
@@ -83,10 +84,27 @@ pub struct BookBuilder {
 
 // @student w10
 impl BookBuilder {
-    /// A builder that has seen nothing yet (out of sync).
+    /// A builder over [`MapDepth`] that has seen nothing yet (out of sync).
     pub fn new() -> BookBuilder {
+        BookBuilder::with_depth(MapDepth::default())
+    }
+}
+
+impl Default for BookBuilder {
+    fn default() -> Self {
+        BookBuilder::new()
+    }
+}
+
+// @student w10
+impl<D: DepthBook> BookBuilder<D> {
+    /// A builder that keeps its book in `depth` (cleared first) and has
+    /// seen nothing yet (out of sync).
+    pub fn with_depth(depth: D) -> BookBuilder<D> {
+        let mut depth = depth;
+        depth.load(&L2Snapshot::default());
         BookBuilder {
-            depth: Depth::default(),
+            depth,
             seq: None,
             synced: false,
             buffer: Vec::new(),
@@ -94,8 +112,14 @@ impl BookBuilder {
         }
     }
 
-    /// Applies one incremental. In sync and next in sequence: O(log
-    /// levels). Otherwise it is buffered (amortized O(1)) or ignored.
+    /// The depth the book is kept in — for queries beyond this API (the
+    /// ladder's vectorized aggregates, for example).
+    pub fn depth_book(&self) -> &D {
+        &self.depth
+    }
+
+    /// Applies one incremental. In sync and next in sequence: one
+    /// [`DepthBook::set`] (O(log levels) for [`MapDepth`]). Otherwise it is buffered (amortized O(1)) or ignored.
     #[inline]
     pub fn apply_update(&mut self, u: &L2Update) -> UpdateOutcome {
         if self.synced {
@@ -184,17 +208,20 @@ impl BookBuilder {
         self.buffer.len()
     }
 
-    /// Highest bid level. O(log levels).
+    /// Highest bid level. O(log levels) with [`MapDepth`], O(1) with the
+    /// ladder.
     pub fn best_bid(&self) -> Option<Level> {
         self.depth.best(Side::Buy)
     }
 
-    /// Lowest ask level. O(log levels).
+    /// Lowest ask level. O(log levels) with [`MapDepth`], O(1) with the
+    /// ladder.
     pub fn best_ask(&self) -> Option<Level> {
         self.depth.best(Side::Sell)
     }
 
-    /// Aggregate quantity at one level (zero if absent). O(log levels).
+    /// Aggregate quantity at one level (zero if absent). O(log levels)
+    /// with [`MapDepth`], O(1) with the ladder.
     pub fn level_qty(&self, side: Side, price: Price) -> Qty {
         self.depth.get(side, price)
     }
