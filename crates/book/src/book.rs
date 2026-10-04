@@ -4,12 +4,12 @@
 use crate::IdMap;
 use crate::{BookError, LevelInfo, OrderBook, RestingOrder};
 #[allow(unused_imports)] // used by the reference internals
-use std::collections::{btree_map, hash_map, BTreeMap};
+use std::collections::hash_map;
 use types::{OrderId, Price, Qty, Side};
 
 // @student-begin w06
 /// "No index" sentinel for the intrusive links.
-const NIL: u32 = u32::MAX;
+pub(crate) const NIL: u32 = u32::MAX;
 
 /// One resting order: a node in its level's intrusive, doubly linked FIFO.
 /// 32 bytes, so two nodes share a cache line.
@@ -35,23 +35,26 @@ struct Level {
 }
 
 /// Vec-backed storage with a free list: stable `u32` handles, slots reused
-/// after removal, so a warmed-up book never allocates per order.
+/// after removal, so a warmed-up book never allocates per order. The free
+/// list is reserved alongside the items, so freeing never allocates either.
+///
+/// Shared with the w28 [`LadderBook`](crate::LadderBook).
 #[derive(Clone, Debug)]
-struct Arena<T> {
+pub(crate) struct Arena<T> {
     items: Vec<T>,
     free: Vec<u32>,
 }
 
 impl<T> Arena<T> {
-    fn with_capacity(n: usize) -> Self {
+    pub(crate) fn with_capacity(n: usize) -> Self {
         Arena {
             items: Vec::with_capacity(n),
-            free: Vec::new(),
+            free: Vec::with_capacity(n),
         }
     }
 
     #[inline]
-    fn insert(&mut self, item: T) -> u32 {
+    pub(crate) fn insert(&mut self, item: T) -> u32 {
         match self.free.pop() {
             Some(i) => {
                 self.items[i as usize] = item;
@@ -61,6 +64,10 @@ impl<T> Arena<T> {
                 let i = u32::try_from(self.items.len()).expect("arena full");
                 assert!(i != NIL, "arena full");
                 self.items.push(item);
+                // Room to free every slot without growing `free`.
+                if self.free.capacity() < self.items.len() {
+                    self.free.reserve(self.items.capacity() - self.free.len());
+                }
                 i
             }
         }
@@ -68,11 +75,11 @@ impl<T> Arena<T> {
 
     /// Marks slot `i` free. The stale value stays until the slot is reused.
     #[inline]
-    fn remove(&mut self, i: u32) {
+    pub(crate) fn remove(&mut self, i: u32) {
         self.free.push(i);
     }
 
-    fn clear(&mut self) {
+    pub(crate) fn clear(&mut self) {
         self.items.clear();
         self.free.clear();
     }
@@ -94,40 +101,111 @@ impl<T> std::ops::IndexMut<u32> for Arena<T> {
 }
 
 #[inline]
-fn side_ix(side: Side) -> usize {
+pub(crate) fn side_ix(side: Side) -> usize {
     match side {
         Side::Buy => 0,
         Side::Sell => 1,
     }
 }
 
-/// True if `a` has better priority than `b` on `side`.
-#[inline]
-fn better(side: Side, a: Price, b: Price) -> bool {
-    match side {
-        Side::Buy => a > b,
-        Side::Sell => a < b,
+/// One side's price levels as a sorted vector with the **best price last**.
+///
+/// `keys` are prices mapped so that "better" means "larger" (bids: the
+/// price; asks: its bitwise complement `!p`, which reverses the order and
+/// cannot overflow), sorted ascending, so the best level is always at the
+/// back: matching removes it with a `pop`, and a new level near the touch
+/// is inserted with a short memmove. `levels[i]` is the arena index of the
+/// level at `keys[i]`. Keeping the keys in their own dense `Vec<i64>`
+/// (struct of arrays) makes the binary search touch as few cache lines as
+/// possible, and a warmed-up index never allocates (a `BTreeMap` allocates
+/// and frees nodes as levels come and go).
+///
+/// Shared with the w27 [`SlabBook`](crate::SlabBook).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct PriceIndex {
+    pub(crate) keys: Vec<i64>,
+    pub(crate) levels: Vec<u32>,
+}
+
+impl PriceIndex {
+    pub(crate) fn with_capacity(n: usize) -> PriceIndex {
+        PriceIndex {
+            keys: Vec::with_capacity(n),
+            levels: Vec::with_capacity(n),
+        }
+    }
+
+    /// The sort key of `price` on `side` (better = larger).
+    #[inline]
+    pub(crate) fn key(side: Side, price: Price) -> i64 {
+        match side {
+            Side::Buy => price.0,
+            Side::Sell => !price.0,
+        }
+    }
+
+    /// Arena index of the best level, or `NIL`.
+    #[inline]
+    pub(crate) fn best(&self) -> u32 {
+        self.levels.last().copied().unwrap_or(NIL)
+    }
+
+    /// Position of `key`, or where it would be inserted. The touch is
+    /// checked first: most lookups (adds joining the best level, the
+    /// matcher emptying it) are there.
+    #[inline]
+    pub(crate) fn find(&self, key: i64) -> Result<usize, usize> {
+        match self.keys.last() {
+            Some(&last) if last == key => Ok(self.keys.len() - 1),
+            Some(&last) if last < key => Err(self.keys.len()),
+            _ => self.keys.binary_search(&key),
+        }
+    }
+
+    /// Arena index of the level at `price`, if it exists. O(log L).
+    #[inline]
+    pub(crate) fn get(&self, side: Side, price: Price) -> Option<u32> {
+        self.find(Self::key(side, price))
+            .ok()
+            .map(|i| self.levels[i])
+    }
+
+    #[inline]
+    pub(crate) fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    /// Inserts level `li` with sort key `key` at position `at` (from
+    /// [`find`](Self::find)). O(levels better than it).
+    #[inline]
+    pub(crate) fn insert(&mut self, at: usize, key: i64, li: u32) {
+        self.keys.insert(at, key);
+        self.levels.insert(at, li);
+    }
+
+    /// Removes the level with sort key `key`, which must be indexed.
+    /// O(1) for the best level, else O(log L + levels better than it).
+    #[inline]
+    pub(crate) fn remove(&mut self, key: i64) {
+        let i = self.find(key).expect("a live level is indexed");
+        self.keys.remove(i);
+        self.levels.remove(i);
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.keys.clear();
+        self.levels.clear();
     }
 }
 
-/// Finds the level for `price`, creating it (and updating the cached best)
-/// if needed. Takes the fields it needs so the caller can keep a borrow of
-/// the id index alive.
+/// Finds the level for `price`, creating it if needed. Takes the fields it
+/// needs so the caller can keep a borrow of the id index alive.
 #[inline]
-fn level_for(
-    map: &mut BTreeMap<Price, u32>,
-    levels: &mut Arena<Level>,
-    best: &mut u32,
-    side: Side,
-    price: Price,
-) -> u32 {
-    // Fast path: most adds join the touch.
-    if *best != NIL && levels[*best].price == price {
-        return *best;
-    }
-    match map.entry(price) {
-        btree_map::Entry::Occupied(e) => *e.get(),
-        btree_map::Entry::Vacant(e) => {
+fn level_for(index: &mut PriceIndex, levels: &mut Arena<Level>, side: Side, price: Price) -> u32 {
+    let key = PriceIndex::key(side, price);
+    match index.find(key) {
+        Ok(i) => index.levels[i],
+        Err(i) => {
             let li = levels.insert(Level {
                 price,
                 total: Qty::ZERO,
@@ -136,10 +214,7 @@ fn level_for(
                 tail: NIL,
                 side,
             });
-            e.insert(li);
-            if *best == NIL || better(side, price, levels[*best].price) {
-                *best = li;
-            }
+            index.insert(i, key, li);
             li
         }
     }
@@ -199,21 +274,14 @@ impl Book {
         }
     }
 
-    /// Removes an empty level; if it was the best, the next best comes from
-    /// the tree (the only O(log L) step on the cancel / fill paths).
-    #[cold]
+    /// Removes an empty level from its side's index and frees it. The best
+    /// level (the common case: the matcher emptied it) is a `pop`; any
+    /// other is a binary search plus a memmove of the better levels.
+    #[inline]
     fn remove_level(&mut self, li: u32) {
         let Level { price, side, .. } = self.levels[li];
-        let s = side_ix(side);
-        self.prices[s].remove(&price);
+        self.sides[side_ix(side)].remove(PriceIndex::key(side, price));
         self.levels.remove(li);
-        if self.best[s] == li {
-            let next = match side {
-                Side::Buy => self.prices[s].last_key_value(),
-                Side::Sell => self.prices[s].first_key_value(),
-            };
-            self.best[s] = next.map_or(NIL, |(_, &l)| l);
-        }
     }
 
     /// Walks the FIFO of level `li`; returns false if `f` stopped early.
@@ -251,16 +319,27 @@ impl Book {
 /// * top-N depth and visits in O(log L + visited), best first;
 /// * no allocation per operation once warmed up, beyond opening a new
 ///   price level.
+///
+/// Since w26 (profiling) it also never allocates once warmed up, not even
+/// to open a level: the w26 tests hold the engine to that.
 // @student w06
 #[derive(Clone, Debug)]
 pub struct Book {
     // Representation and why:
     //
-    // * Price levels: one `BTreeMap<Price, level index>` per side. Prices
-    //   are sparse and unbounded (a ladder array needs a fixed price window;
-    //   that is w28), levels come and go far less often than orders, and
-    //   ordered iteration gives depth and FOK walks for free. Opening or
-    //   removing a level is O(log L).
+    // * Price levels: one sorted vector of prices per side with the best
+    //   price at the back (`PriceIndex`). Levels near the touch, where
+    //   nearly all activity is, are found with one compare and opened or
+    //   closed with a short memmove; any other level is a binary search
+    //   over a dense `Vec<i64>`. Ordered iteration (depth, FOK walks) is a
+    //   reverse slice walk.
+    //   The first version used a `BTreeMap<Price, level>` per side. A
+    //   profile of the w07 flow (w26) put ~20% of engine time in the
+    //   B-tree search on every add away from the touch, and ~9% in level
+    //   removal; the tree also allocated and freed nodes as levels came and
+    //   went, so the engine was never allocation-free. A sorted vector
+    //   fixes all three, at the price of an O(L) worst case to open or
+    //   close a level far from the touch (rare, and still a memmove).
     // * Orders: nodes in a Vec-backed arena with a free list, linked into an
     //   intrusive doubly linked FIFO per level (`prev`/`next` indices in the
     //   node). Append, pop-front and unlink-from-the-middle are all O(1), and
@@ -270,21 +349,17 @@ pub struct Book {
     //   cancel-heavy flow.)
     // * Order index: `OrderId -> node` in a hash map with a one-multiply
     //   integer hasher (`IdMap`), so cancel and reduce never search a level.
-    // * Cached best level per side: best bid/ask and the matching front are
-    //   O(1); the tree is consulted only when the best level empties.
     //
-    // | operation                | cost                                   |
-    // | add                      | O(1) at an existing level, O(log L) new |
-    // | cancel                   | O(1), O(log L) if it empties its level  |
+    // | operation                | cost (d = levels between it and the touch) |
+    // | add                      | O(1) at the best, O(log L) elsewhere; +O(d) to open a level |
+    // | cancel                   | O(1); +O(log L + d) if it empties its level |
     // | reduce, get, best, front | O(1)                                    |
-    // | fill_front               | O(1), O(log L) if it empties the best   |
+    // | fill_front               | O(1) (emptying the best level is a pop) |
     // | level                    | O(log L)                                |
     nodes: Arena<Node>,
     levels: Arena<Level>,
-    /// `prices[0]` bids, `prices[1]` asks: price → level index.
-    prices: [BTreeMap<Price, u32>; 2],
-    /// Cached best level index per side (`NIL` when the side is empty).
-    best: [u32; 2],
+    /// `sides[0]` bids, `sides[1]` asks: sorted price → level index.
+    sides: [PriceIndex; 2],
     index: IdMap<u32>,
 }
 
@@ -301,8 +376,10 @@ impl Book {
         Book {
             nodes: Arena::with_capacity(orders),
             levels: Arena::with_capacity(levels),
-            prices: [BTreeMap::new(), BTreeMap::new()],
-            best: [NIL, NIL],
+            sides: [
+                PriceIndex::with_capacity(levels),
+                PriceIndex::with_capacity(levels),
+            ],
             index: IdMap::with_capacity_and_hasher(orders, Default::default()),
         }
     }
@@ -328,9 +405,8 @@ impl OrderBook for Book {
         };
         let s = side_ix(order.side);
         let li = level_for(
-            &mut self.prices[s],
+            &mut self.sides[s],
             &mut self.levels,
-            &mut self.best[s],
             order.side,
             order.price,
         );
@@ -392,19 +468,19 @@ impl OrderBook for Book {
 
     #[inline]
     fn best(&self, side: Side) -> Option<LevelInfo> {
-        let li = self.best[side_ix(side)];
+        let li = self.sides[side_ix(side)].best();
         (li != NIL).then(|| self.level_info(li))
     }
 
     fn level(&self, side: Side, price: Price) -> Option<LevelInfo> {
-        self.prices[side_ix(side)]
-            .get(&price)
-            .map(|&li| self.level_info(li))
+        self.sides[side_ix(side)]
+            .get(side, price)
+            .map(|li| self.level_info(li))
     }
 
     #[inline]
     fn front(&self, side: Side) -> Option<RestingOrder> {
-        let li = self.best[side_ix(side)];
+        let li = self.sides[side_ix(side)].best();
         if li == NIL {
             return None;
         }
@@ -420,7 +496,7 @@ impl OrderBook for Book {
 
     #[inline]
     fn fill_front(&mut self, side: Side, qty: Qty) -> Qty {
-        let li = self.best[side_ix(side)];
+        let li = self.sides[side_ix(side)].best();
         assert!(li != NIL, "fill_front: no {side:?} orders");
         let ni = self.levels[li].head;
         let node = &mut self.nodes[ni];
@@ -444,47 +520,24 @@ impl OrderBook for Book {
     }
 
     fn visit_levels(&self, side: Side, f: &mut dyn FnMut(LevelInfo) -> bool) {
-        let map = &self.prices[side_ix(side)];
-        match side {
-            Side::Buy => {
-                for &li in map.values().rev() {
-                    if !f(self.level_info(li)) {
-                        return;
-                    }
-                }
-            }
-            Side::Sell => {
-                for &li in map.values() {
-                    if !f(self.level_info(li)) {
-                        return;
-                    }
-                }
+        // Best first = back to front.
+        for &li in self.sides[side_ix(side)].levels.iter().rev() {
+            if !f(self.level_info(li)) {
+                return;
             }
         }
     }
 
     fn visit_level(&self, side: Side, price: Price, f: &mut dyn FnMut(RestingOrder) -> bool) {
-        if let Some(&li) = self.prices[side_ix(side)].get(&price) {
+        if let Some(li) = self.sides[side_ix(side)].get(side, price) {
             self.walk_level(li, f);
         }
     }
 
     fn visit_orders(&self, side: Side, f: &mut dyn FnMut(RestingOrder) -> bool) {
-        let map = &self.prices[side_ix(side)];
-        match side {
-            Side::Buy => {
-                for &li in map.values().rev() {
-                    if !self.walk_level(li, f) {
-                        return;
-                    }
-                }
-            }
-            Side::Sell => {
-                for &li in map.values() {
-                    if !self.walk_level(li, f) {
-                        return;
-                    }
-                }
+        for &li in self.sides[side_ix(side)].levels.iter().rev() {
+            if !self.walk_level(li, f) {
+                return;
             }
         }
     }
@@ -496,15 +549,14 @@ impl OrderBook for Book {
 
     #[inline]
     fn level_count(&self, side: Side) -> usize {
-        self.prices[side_ix(side)].len()
+        self.sides[side_ix(side)].len()
     }
 
     fn clear(&mut self) {
         self.nodes.clear();
         self.levels.clear();
-        self.prices[0].clear();
-        self.prices[1].clear();
-        self.best = [NIL, NIL];
+        self.sides[0].clear();
+        self.sides[1].clear();
         self.index.clear();
     }
 }

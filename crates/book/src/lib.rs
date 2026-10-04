@@ -8,8 +8,16 @@
 //!   [`BookError`]. The matching engine is written against this trait only,
 //!   so the w06 [`Book`], the w27 slab book and the w28 ladder book are
 //!   interchangeable (`engine::Engine<B: OrderBook>`).
-//! * the **w06 implementation**, [`Book`]: `BTreeMap` price levels, an
-//!   intrusive FIFO per level and an order-id index (see its docs for why).
+//! * the **implementations**:
+//!   * w06 [`Book`]: a sorted price index per side, an intrusive FIFO per
+//!     level and an order-id index (see its docs for why; the price index
+//!     was a `BTreeMap` until profiling in w26);
+//!   * w27 [`SlabBook`]: the same structure on preallocated generational
+//!     [`Slab`]s — zero allocations within its capacity, and stale-proof
+//!     [`SlabKey`] handles to resting orders;
+//!   * w28 [`LadderBook`]: a dense array of levels over a window of prices
+//!     around the touch (O(1) level lookup, bitmap scan for the next best),
+//!     with a sparse map for far prices.
 //!
 //! A book holds one instrument and knows nothing about matching rules,
 //! validation or events: it stores resting orders in price-time priority and
@@ -18,9 +26,15 @@
 
 mod book;
 mod hash;
+mod ladder;
+mod slab;
+mod slab_book;
 
 pub use book::Book;
 pub use hash::{IdBuildHasher, IdHasher, IdMap};
+pub use ladder::LadderBook;
+pub use slab::{Slab, SlabKey};
+pub use slab_book::SlabBook;
 
 use types::{OrderId, Price, Qty, RejectReason, Side};
 

@@ -13,6 +13,8 @@ book = { workspace = true }
 # core itself uses neither.
 journal = { workspace = true }
 marketdata = { workspace = true }
+# w37: the w15 pre-trade risk engine as a `RiskPolicy`.
+risk = { workspace = true }
 
 [dev-dependencies]
 benchkit = { workspace = true }

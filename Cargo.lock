@@ -31,6 +31,7 @@ dependencies = [
  "book",
  "journal",
  "marketdata",
+ "risk",
  "telemetry",
  "types",
 ]
