@@ -174,3 +174,58 @@ impl Default for Journal {
         Journal::new()
     }
 }
+
+use crate::frame::FrameError;
+// @student-begin w20
+use crate::frame::CorruptionKind;
+// @student-end
+
+// @student w20
+impl Journal {
+    /// Appends one complete frame received from elsewhere — a primary's
+    /// replication stream (week 20) — after checking that `frame` is exactly
+    /// one well-formed frame, that its CRC matches, that its payload decodes
+    /// and that it carries [`next_seq`](Journal::next_seq). Returns that
+    /// sequence number.
+    ///
+    /// A refused frame changes nothing; the error says whether it was
+    /// damaged, a retransmission ([`FrameError::Duplicate`]) or early
+    /// ([`FrameError::Gap`]). O(frame length).
+    pub fn append_frame(&mut self, frame: &[u8]) -> Result<Seq, FrameError> {
+        let expected = self.next_seq;
+        let f = match Frames::new(frame, expected).next() {
+            Some(Ok(f)) => f,
+            Some(Err(c)) => {
+                return Err(match c.kind {
+                    CorruptionKind::SeqMismatch { expected, found } if found < expected => {
+                        FrameError::Duplicate { expected, found }
+                    }
+                    CorruptionKind::SeqMismatch { expected, found } => {
+                        FrameError::Gap { expected, found }
+                    }
+                    _ => FrameError::Corrupt(c),
+                })
+            }
+            None => {
+                return Err(FrameError::Corrupt(Corruption {
+                    offset: 0,
+                    kind: CorruptionKind::Truncated {
+                        needed: crate::frame::FRAME_HEADER_LEN,
+                        available: 0,
+                    },
+                }))
+            }
+        };
+        if f.frame_len() != frame.len() {
+            return Err(FrameError::TrailingBytes {
+                frame_len: f.frame_len(),
+                len: frame.len(),
+            });
+        }
+        f.command()
+            .map_err(|error| FrameError::Decode { seq: f.seq, error })?;
+        self.buf.extend_from_slice(frame);
+        self.next_seq = Seq(expected.0 + 1);
+        Ok(expected)
+    }
+}

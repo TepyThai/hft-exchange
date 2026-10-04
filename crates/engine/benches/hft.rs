@@ -6,8 +6,17 @@
 
 use benchkit::{black_box, Report, Unit};
 use engine::testkit::{FlowConfig, OrderFlow};
-use engine::{Engine, OrderBook};
+use engine::{Engine, OrderBook, Pipeline};
+use journal::{
+    FileStorage, Handled, Journal, JournalOptions, Primary, SnapshotStore, Standby, SyncPolicy,
+    SystemClock, MAX_FRAME_LEN,
+};
 use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use telemetry::{Clock, OpenLoop};
 use types::{Command, Event, InstrumentSpec, NewOrder, OrderId, Price, Rng, Side, TimeInForce};
 
 const MID: i64 = 100_000;
@@ -237,39 +246,58 @@ fn fok_check() -> Report {
     )
 }
 
-/// The w12 generator's default stream (adds, cancels, reduces, IOC / FOK /
-/// post-only / market orders, malformed commands) through the engine alone.
-/// The journal and market data stages of engine v1 are wired in later; this
-/// measures the matching core on that flow.
-fn engine_v1_throughput() -> Report {
-    const N: usize = 1_000_000;
+/// `n` commands of the w12 generator's default flow (adds, cancels,
+/// reduces, IOC / FOK / post-only / market orders, malformed commands),
+/// fed back through a shadow engine so cancels and reduces hit live orders.
+fn w12_stream(seed: u64, n: usize) -> (FlowConfig, Vec<Command>) {
     let cfg = FlowConfig {
-        seed: 0x1212,
+        seed,
         ..FlowConfig::default()
     };
     let mut flow = OrderFlow::new(cfg);
     let mut shadow = Engine::with_config(cfg.engine_config());
     let mut out = Vec::new();
-    let mut cmds = Vec::with_capacity(N);
-    for _ in 0..N {
+    let mut cmds = Vec::with_capacity(n);
+    for _ in 0..n {
         let cmd = flow.next_command();
         out.clear();
         shadow.process(&cmd, &mut out);
         flow.observe(&cmd, &out);
         cmds.push(cmd);
     }
+    (cfg, cmds)
+}
+
+/// Bytes of in-memory journal the w12 pipeline keeps before draining it.
+const V1_JOURNAL_BYTES: usize = 256 * 1024;
+
+const V1_LABEL: &str = "Engine v1 end to end (journal + match + md)";
+
+/// The w12 stream through engine v1, the whole [`Pipeline`]: each command
+/// is appended to the in-memory journal (sequenced, encoded, checksummed),
+/// matched, and its events turned into L2 updates. The journal is drained
+/// (cleared — sequence numbers continue) every 256 KiB, as if its frames
+/// had been handed to a disk writer, so its write head stays in cache.
+fn engine_v1_throughput() -> Report {
+    const N: usize = 1_000_000;
+    let (cfg, cmds) = w12_stream(0x1212, N);
     benchkit::throughput(
         "w12.engine_v1_throughput",
-        "Engine v1 end to end (journal + match + md)",
+        V1_LABEL,
         Unit::OpsPerSec,
         N as u64,
         || {
-            let mut engine = Engine::with_config(cfg.engine_config());
+            let journal = Journal::with_capacity(V1_JOURNAL_BYTES);
+            let engine = Engine::with_config(cfg.engine_config());
+            let mut p = Pipeline::with_journal(journal, engine).expect("both fresh");
             for cmd in &cmds {
-                engine.process(cmd, &mut out);
-                out.clear();
+                if p.journal().byte_len() + MAX_FRAME_LEN > V1_JOURNAL_BYTES {
+                    p.journal_mut().clear();
+                }
+                let out = p.process(cmd).expect("an in-memory journal never fails");
+                black_box(out.updates.len());
             }
-            black_box(engine.seq());
+            black_box(p.engine().seq());
         },
     )
 }
@@ -291,10 +319,226 @@ fn main() {
             "FOK feasibility check, deep book",
             fok_check,
         ),
-        (
-            "w12.engine_v1_throughput",
-            "Engine v1 end to end (journal + match + md)",
-            engine_v1_throughput,
-        ),
+        ("w12.engine_v1_throughput", V1_LABEL, engine_v1_throughput),
+        ("w18.recovery", RECOVERY_LABEL, recovery),
+        ("w20.replication_lag", REPLICATION_LABEL, replication_lag),
+        ("w25.engine_open_loop", OPEN_LOOP_LABEL, engine_open_loop),
     ]);
+}
+
+// --- Week 18 ----------------------------------------------------------------
+
+const RECOVERY_LABEL: &str = "Recover a 1M-command journal: snapshot at 750k + replay 250k tail \
+     (verify whole file, warm page cache)";
+
+/// A directory under the system temp dir, removed on drop (also when a
+/// template stub panics).
+struct BenchDir(PathBuf);
+
+impl BenchDir {
+    fn new(tag: &str) -> BenchDir {
+        let path = std::env::temp_dir().join(format!("hft-bench-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).expect("temp dir");
+        BenchDir(path)
+    }
+}
+
+impl Drop for BenchDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Crash recovery of a durable engine: a 1M-command w12 journal (~45 MB)
+/// with snapshots every 250k commands. Each sample is a full
+/// `engine::recover`: open and verify every frame of the journal (CRC,
+/// sequence, rebuilding the index), load the newest snapshot (750k) and
+/// replay the 250k-command tail. The file is in the page cache, so this is
+/// the CPU cost of recovery, not the disk's.
+fn recovery() -> Report {
+    const N: usize = 1_000_000;
+    const SNAPSHOT_EVERY: usize = 250_000;
+    const WARMUP: usize = 2;
+    const SAMPLES: usize = 15;
+    let (cfg, cmds) = w12_stream(0x1818, N);
+    let dir = BenchDir::new("w18-recovery");
+    let log = dir.0.join("journal.log");
+    let store = SnapshotStore::open(dir.0.join("snapshots")).expect("snapshot dir");
+    let opts = JournalOptions::with_sync(SyncPolicy::Never);
+    let open = || {
+        let storage = FileStorage::open(&log).expect("journal file");
+        engine::recover(
+            cfg.engine_config(),
+            storage,
+            Some(&store),
+            opts,
+            SystemClock::new(),
+        )
+        .expect("recovery")
+    };
+    {
+        let (mut p, _) = open();
+        for (i, cmd) in cmds.iter().enumerate() {
+            p.process(cmd).expect("journal append");
+            if (i + 1) % SNAPSHOT_EVERY == 0 && i + 1 < N {
+                p.checkpoint(&store).expect("snapshot");
+            }
+        }
+        p.journal_mut().sync().expect("sync");
+    }
+    let mut hist = benchkit::Histogram::new();
+    let mut bytes = 0;
+    for i in 0..WARMUP + SAMPLES {
+        let t = Instant::now();
+        let (p, report) = open();
+        let elapsed = t.elapsed();
+        assert_eq!(
+            report.snapshot,
+            Some(types::Seq((N - SNAPSHOT_EVERY) as u64))
+        );
+        assert_eq!(report.replayed, SNAPSHOT_EVERY as u64);
+        bytes = p.journal().byte_len();
+        black_box(p.engine().state_hash());
+        if i >= WARMUP {
+            hist.record(elapsed.as_nanos() as u64);
+        }
+    }
+    eprintln!("journal: {N} commands, {bytes} bytes");
+    hist.report("w18.recovery", RECOVERY_LABEL, Unit::Us)
+}
+
+// --- Week 20 ----------------------------------------------------------------
+
+const REPLICATION_LABEL: &str =
+    "Primary append -> standby applied (validated, journaled, matched), \
+     in-process, 100k cmds/s, spinning standby";
+
+/// Replication lag to a hot standby: the primary sequences the w12 flow at
+/// 100k commands per second (open loop), each through `Primary::append`
+/// (journal + send); a standby thread spinning on its channel validates
+/// each frame (CRC, sequence), appends it to its journal, applies it to its
+/// own engine and acknowledges. Lag = applied on the standby − start of the
+/// primary's append, per command (TSC clock shared by both threads).
+fn replication_lag() -> Report {
+    const N: usize = 200_000;
+    const WARMUP: usize = 20_000;
+    const INTERVAL_NS: u64 = 10_000;
+    let total = N + WARMUP;
+    let (cfg, cmds) = w12_stream(0x2020, total);
+    let clock = *Clock::global();
+    let stamps: Arc<Vec<AtomicU64>> = Arc::new((0..=total).map(|_| AtomicU64::new(0)).collect());
+    let lease = Duration::from_secs(3_600);
+    let leases = SystemClock::new();
+    let (plink, slink) = journal::link();
+    let standby = Standby::new(
+        Journal::with_capacity(total * MAX_FRAME_LEN),
+        Engine::with_config(cfg.engine_config()),
+        slink,
+        leases,
+        lease,
+    );
+    let seen = Arc::clone(&stamps);
+    let standby = std::thread::spawn(move || {
+        let mut s = standby;
+        let mut hist = benchkit::Histogram::new();
+        loop {
+            match s.poll_one() {
+                Ok(Some(Handled::Applied(seq))) => {
+                    let now = clock.now();
+                    let sent = seen[seq.0 as usize].load(Ordering::Relaxed);
+                    if seq.0 > WARMUP as u64 {
+                        hist.record(now.saturating_sub(sent));
+                    }
+                }
+                Ok(Some(other)) => panic!("unexpected {other:?}"),
+                Ok(None) => std::hint::spin_loop(),
+                // The primary is done and every frame handled.
+                Err(_) => return hist,
+            }
+        }
+    });
+    let mut primary = Primary::new(
+        Journal::with_capacity(total * MAX_FRAME_LEN),
+        plink,
+        leases,
+        lease,
+    );
+    let start = clock.now();
+    for (i, cmd) in cmds.iter().enumerate() {
+        let due = start + i as u64 * INTERVAL_NS;
+        while clock.now() < due {
+            std::hint::spin_loop();
+        }
+        stamps[i + 1].store(clock.now(), Ordering::Relaxed);
+        black_box(primary.append(cmd).expect("the standby granted a lease"));
+    }
+    drop(primary);
+    let hist = standby.join().expect("standby thread");
+    hist.report("w20.replication_lag", REPLICATION_LABEL, Unit::Us)
+}
+
+// --- Week 25 ----------------------------------------------------------------
+
+const OPEN_LOOP_LABEL: &str = "Engine under open-loop load at 50% utilization (mixed flow), \
+     response time from intended start";
+
+/// The real engine under `telemetry::OpenLoop`: the w07 mixed flow is
+/// offered at a fixed rate and each command's latency is measured from its
+/// *intended* start, so queueing behind a slow command (or an interrupt,
+/// or a preemption) is charged to every command that waited.
+///
+/// The rate is set for 50% utilization of the serving thread: first the
+/// same harness runs the flow back to back (every request already due) to
+/// measure the cost per command — engine plus the harness's clock reads and
+/// histogram records, which share the thread — then the interval is twice
+/// that. 1M measured commands after 100k of warm-up.
+fn engine_open_loop() -> Report {
+    const REQUESTS: u64 = 1_000_000;
+    const WARMUP: u64 = 100_000;
+    let total = (REQUESTS + WARMUP) as usize;
+    let (base, cmds) = mixed_flow(total, 0x2525);
+    let mut out = Vec::with_capacity(64);
+
+    // Capacity: the same harness with every request already due (closed
+    // loop, back to back) — engine plus measurement cost per command.
+    let mut clock = *Clock::global();
+    let mut busy = base.clone();
+    let flat_out = OpenLoop::at_rate(1_000_000_000, total as u64).run(&mut clock, |_, i| {
+        busy.process(&cmds[i as usize], &mut out);
+        out.clear();
+    });
+    black_box(busy.seq());
+    let service_ns = flat_out.elapsed_ns as f64 / flat_out.requests as f64;
+    let interval_ns = ((2.0 * service_ns).ceil() as u64).max(20);
+
+    let mut engine = base.clone();
+    let schedule = OpenLoop::at_rate(1_000_000_000 / interval_ns, REQUESTS).with_warmup(WARMUP);
+    let r = schedule.run(&mut clock, |_, i| {
+        engine.process(&cmds[i as usize], &mut out);
+        out.clear();
+    });
+    black_box(engine.seq());
+    eprintln!(
+        "per-command cost (engine + harness) {service_ns:.1} ns -> interval {interval_ns} ns ({:.2}M/s offered, \
+         {:.2}M/s achieved), max lag {} ns; service-time view: p50 {} p99 {} p99.9 {} ns",
+        r.offered_rate() / 1e6,
+        r.achieved_rate() / 1e6,
+        r.max_lag_ns,
+        r.service.percentile(0.5),
+        r.service.percentile(0.99),
+        r.service.percentile(0.999),
+    );
+    let h = &r.response;
+    Report {
+        id: "w25.engine_open_loop".into(),
+        label: OPEN_LOOP_LABEL.into(),
+        unit: Unit::Ns,
+        value: h.percentile(0.5) as f64,
+        p50: Some(h.percentile(0.5) as f64),
+        p99: Some(h.percentile(0.99) as f64),
+        p999: Some(h.percentile(0.999) as f64),
+        max: Some(h.max() as f64),
+        samples: h.count(),
+    }
 }

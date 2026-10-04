@@ -253,3 +253,46 @@ impl<'a> Iterator for Frames<'a> {
 }
 
 impl std::iter::FusedIterator for Frames<'_> {}
+
+/// Why [`Journal::append_frame`](crate::Journal::append_frame) refused a
+/// frame received from elsewhere (week 20: a primary's replication stream).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameError {
+    /// Not a well-formed frame: truncated, a bad length field or a CRC
+    /// mismatch (`offset` is 0, the start of the frame).
+    Corrupt(Corruption),
+    /// A valid frame followed by `len - frame_len` extra bytes.
+    TrailingBytes { frame_len: usize, len: usize },
+    /// The frame's sequence number is below the next expected one: it was
+    /// already appended (a retransmission).
+    Duplicate { expected: Seq, found: Seq },
+    /// The frame's sequence number is above the next expected one: frames
+    /// `expected .. found` are missing.
+    Gap { expected: Seq, found: Seq },
+    /// The frame verifies but its payload is not a command (a broken
+    /// writer, not a broken link).
+    Decode { seq: Seq, error: DecodeError },
+}
+
+impl fmt::Display for FrameError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            FrameError::Corrupt(c) => write!(f, "{c}"),
+            FrameError::TrailingBytes { frame_len, len } => {
+                write!(
+                    f,
+                    "{len} bytes hold a {frame_len}-byte frame and trailing bytes"
+                )
+            }
+            FrameError::Duplicate { expected, found } => {
+                write!(f, "duplicate frame {} (expected {})", found.0, expected.0)
+            }
+            FrameError::Gap { expected, found } => {
+                write!(f, "gap: got frame {}, expected {}", found.0, expected.0)
+            }
+            FrameError::Decode { seq, error } => write!(f, "frame {}: {error}", seq.0),
+        }
+    }
+}
+
+impl std::error::Error for FrameError {}
