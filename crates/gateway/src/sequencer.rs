@@ -171,6 +171,41 @@ impl Sequencer {
     }
 }
 
+// @student w24
+impl Sequencer {
+    /// Week 24: a sequencer over engines that already hold state — rebuilt
+    /// from their journals after a restart — whose exchange order ids
+    /// continue at `next_order_id`, so an id is never assigned twice across
+    /// restarts. The engines' `spec.id`s must be distinct. Orders resting
+    /// in them belong to no session (their sessions died with the old
+    /// process): they trade normally, and reports about them are dropped.
+    /// O(engines).
+    pub fn with_engines(
+        engines: Vec<Engine>,
+        next_order_id: OrderId,
+        hooks: Hooks,
+        cancel_on_disconnect: bool,
+    ) -> Sequencer {
+        Sequencer {
+            engines: engines
+                .into_iter()
+                .map(|e| (e.config().spec.id, e))
+                .collect(),
+            router: OrderRouter::starting_at(next_order_id.0.max(1)),
+            hooks,
+            cancel_on_disconnect,
+            events: Vec::with_capacity(256),
+            sequenced: 0,
+        }
+    }
+
+    /// Week 24: the engine thread found its queue empty; passes it on to
+    /// [`Stage::on_idle`](crate::Stage::on_idle) (an interval fsync).
+    pub fn idle(&mut self) {
+        self.hooks.stage.on_idle();
+    }
+}
+
 // @student-begin w13
 impl Sequencer {
     fn engine_index(&self, instrument: InstrumentId) -> Option<usize> {

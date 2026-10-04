@@ -100,6 +100,10 @@ pub struct GatewaySettings {
     pub recv_buffer: u32,
     /// `vectored_writes`. Default false.
     pub vectored_writes: bool,
+    /// `busy_reject` (week 24): answer a new order that finds the engine
+    /// queue full with a busy reject instead of waiting (see
+    /// [`GatewayConfig::busy_reject`]). Default false.
+    pub busy_reject: bool,
 }
 
 /// `[engine]`: the matching thread.
@@ -157,6 +161,10 @@ pub struct MarketDataSettings {
     pub subscriber_queue: usize,
     /// `conflate`: conflate a lagging subscriber's updates. Default true.
     pub conflate: bool,
+    /// `listen` (week 24): where the WebSocket feed is served — the first
+    /// instrument on this port, the next one on port + 1, and so on.
+    /// Default: not served (in-process subscribers only).
+    pub listen: Option<SocketAddr>,
 }
 
 /// One `[[instrument]]`.
@@ -226,6 +234,7 @@ impl Default for ExchangeConfig {
                 send_buffer: 0,
                 recv_buffer: 0,
                 vectored_writes: false,
+                busy_reject: false,
             },
             engine: EngineSettings {
                 cpu: None,
@@ -252,6 +261,7 @@ impl Default for ExchangeConfig {
                 snapshot_interval: 1000,
                 subscriber_queue: 4096,
                 conflate: true,
+                listen: None,
             },
             instruments: vec![InstrumentSettings {
                 id: 1,
@@ -612,6 +622,7 @@ impl ExchangeConfig {
         kv(&mut out, "send_buffer", int(g.send_buffer as u64));
         kv(&mut out, "recv_buffer", int(g.recv_buffer as u64));
         kv(&mut out, "vectored_writes", Value::Bool(g.vectored_writes));
+        kv(&mut out, "busy_reject", Value::Bool(g.busy_reject));
         out.push_str("\n[engine]\n");
         if let Some(cpu) = self.engine.cpu {
             kv(&mut out, "cpu", int(cpu as u64));
@@ -646,6 +657,9 @@ impl ExchangeConfig {
         kv(&mut out, "snapshot_interval", int(m.snapshot_interval));
         kv(&mut out, "subscriber_queue", int(m.subscriber_queue as u64));
         kv(&mut out, "conflate", Value::Bool(m.conflate));
+        if let Some(addr) = m.listen {
+            kv(&mut out, "listen", Value::Str(addr.to_string()));
+        }
         for i in &self.instruments {
             out.push_str("\n[[instrument]]\n");
             kv(&mut out, "id", int(i.id as u64));
@@ -723,6 +737,7 @@ impl ExchangeConfig {
             engine_cpu: self.engine.cpu,
             tuning,
             vectored_writes: g.vectored_writes,
+            busy_reject: g.busy_reject,
         }
     }
 
@@ -776,6 +791,7 @@ const SECTIONS: &[(&str, &[(&str, Kind)])] = &[
             ("send_buffer", Kind::Int),
             ("recv_buffer", Kind::Int),
             ("vectored_writes", Kind::Bool),
+            ("busy_reject", Kind::Bool),
         ],
     ),
     ("engine", &[("cpu", Kind::Int), ("busy_poll", Kind::Bool)]),
@@ -805,6 +821,7 @@ const SECTIONS: &[(&str, &[(&str, Kind)])] = &[
             ("snapshot_interval", Kind::Int),
             ("subscriber_queue", Kind::Int),
             ("conflate", Kind::Bool),
+            ("listen", Kind::Str),
         ],
     ),
 ];
@@ -1003,6 +1020,9 @@ impl Validator {
         if let Some(x) = f.boolean(self, "vectored_writes") {
             g.vectored_writes = x;
         }
+        if let Some(x) = f.boolean(self, "busy_reject") {
+            g.busy_reject = x;
+        }
         f.finish(self);
 
         let mut f = Fields::new("engine", doc.table("engine"));
@@ -1104,6 +1124,15 @@ impl Validator {
         }
         if let Some(x) = f.boolean(self, "conflate") {
             m.conflate = x;
+        }
+        if let Some(x) = f.get(self, "listen", |v| match v {
+            Value::Str(s) => s
+                .parse::<SocketAddr>()
+                .map(Some)
+                .map_err(|_| Bad::Range("a socket address like \"0.0.0.0:9001\"".into())),
+            other => Err(Bad::Type("a string", other.type_name())),
+        }) {
+            m.listen = x;
         }
         f.finish(self);
 

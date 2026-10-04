@@ -22,6 +22,14 @@
 //! * **Writers** own the write half, drain everything queued for their
 //!   session and write it with one `write` (or `writev`, week 31).
 //!
+//! Week 24 adds, for exchange v2: receive timestamps (`rx_ns`) read from
+//! `telemetry::Clock::global()`, the clock every pipeline stage stamps on;
+//! an optional busy reject at the edge ([`GatewayConfig::busy_reject`]) —
+//! a reader whose new order finds the engine queue full answers it at once
+//! instead of waiting; [`Stage::on_idle`](crate::Stage::on_idle) on every
+//! empty poll; and [`Gateway::start_sequencer`] for engines recovered from
+//! journals.
+//!
 //! **Shutdown** (in this order, so no accepted order loses its reports):
 //! stop accepting and reading, wait for every reader to exit (each tells
 //! the engine thread its session closed), let the engine thread drain its
@@ -37,7 +45,7 @@ use crate::session::{Action, Auth, CloseReason, Session, SessionId, SessionState
 use engine::EngineConfig;
 use std::net::SocketAddr;
 use std::time::Duration;
-use types::InstrumentSpec;
+use types::{InstrumentSpec, RejectReason, RiskReason};
 
 #[allow(unused_imports)] // used by the implementation the learner writes
 use {
@@ -51,9 +59,13 @@ use {
     tokio::net::{TcpListener, TcpStream},
     tokio::sync::{mpsc as tokio_mpsc, Notify},
     tokio::task::JoinSet,
-    types::{AccountId, Command},
+    types::{AccountId, Command, Event},
     wire::{encode_frame, FrameDecoder, Message, FRAME_HEADER_LEN, MAX_MSG_LEN},
 };
+
+/// The reason a busy reject carries (week 24, [`GatewayConfig::busy_reject`]):
+/// the wire protocol's "slow down", shared with the week-17 throttle.
+pub const BUSY: RejectReason = RejectReason::Risk(RiskReason::RateLimit);
 
 /// How the engine thread waits when its inbound queue is empty.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -119,6 +131,16 @@ pub struct GatewayConfig {
     /// Week 31: write reports with one vectored write of per-report frames
     /// instead of one coalesced buffer.
     pub vectored_writes: bool,
+    /// Week 24: what a session does with a new order when the sessions →
+    /// engine queue is full. `false`: wait for room — back-pressure that
+    /// reaches the client through TCP, and latency that grows with the
+    /// queue. `true`: answer at once with `Rejected { reason: BUSY }` — an
+    /// explicit reject the client can act on — counted in
+    /// [`GatewayStats::busy_rejects`]. It goes straight to the session's
+    /// outbound queue, so it can overtake reports of earlier orders still
+    /// in the engine thread. Cancels, reduces, logons and disconnects
+    /// always wait: they release risk and are never refused for load.
+    pub busy_reject: bool,
 }
 
 impl Default for GatewayConfig {
@@ -137,6 +159,7 @@ impl Default for GatewayConfig {
             engine_cpu: None,
             tuning: None,
             vectored_writes: false,
+            busy_reject: false,
         }
     }
 }
@@ -165,6 +188,9 @@ pub struct GatewayStats {
     /// Sessions closed for a protocol violation (bad frame, malformed
     /// message, no logon, bad credentials).
     pub protocol_errors: u64,
+    /// New orders refused at the edge because the engine queue was full
+    /// (week 24, [`GatewayConfig::busy_reject`]).
+    pub busy_rejects: u64,
 }
 
 /// What [`Gateway::shutdown`] did.
@@ -221,60 +247,8 @@ impl Gateway {
     /// returns once the gateway accepts connections. Fails if the address
     /// cannot be bound or a thread cannot be created.
     pub fn start_with(config: GatewayConfig, hooks: Hooks) -> std::io::Result<Gateway> {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(config.io_threads.max(1))
-            .thread_name("gw-io")
-            .enable_io()
-            .enable_time()
-            .build()?;
-        let listener = runtime.block_on(bind(&config))?;
-        let local_addr = listener.local_addr()?;
-
-        let (inbound, rx) = mpsc::channel::<ToEngine>(config.inbound_capacity);
-        let ctx = Arc::new(Ctx {
-            auth: config.auth.clone(),
-            logon_timeout: config.logon_timeout,
-            read_buffer: config.read_buffer.max(64),
-            outbound_capacity: config.outbound_capacity.max(1),
-            tuning: config.tuning,
-            vectored: config.vectored_writes,
-            epoch: Instant::now(),
-            next_session: AtomicU64::new(1),
-            sessions: Mutex::new(HashMap::new()),
-            stop: Stop::new(),
-            engine_done: AtomicBool::new(false),
-            inbound,
-            stats: Counters::default(),
-        });
-
         let sequencer = Sequencer::new(&config.instruments, hooks, config.cancel_on_disconnect);
-        let engine_token = CancelToken::new();
-        let engine = {
-            let ctx = Arc::clone(&ctx);
-            let token = engine_token.clone();
-            let idle = config.engine_idle;
-            let cpu = config.engine_cpu;
-            std::thread::Builder::new()
-                .name("gw-engine".into())
-                .spawn(move || {
-                    if let Some(cpu) = cpu {
-                        if let Err(e) = sync::pin_current_thread(cpu) {
-                            eprintln!("gateway: cannot pin the engine thread to cpu {cpu}: {e}");
-                        }
-                    }
-                    engine_loop(rx, sequencer, &ctx, &token, idle)
-                })?
-        };
-
-        let acceptor = runtime.spawn(acceptor(listener, Arc::clone(&ctx)));
-        Ok(Gateway {
-            runtime: Some(runtime),
-            local_addr,
-            ctx,
-            acceptor: Some(acceptor),
-            engine: Some(engine),
-            engine_token,
-        })
+        launch(config, sequencer)
     }
 
     /// The address the gateway listens on.
@@ -295,6 +269,21 @@ impl Gateway {
     }
 }
 
+// @student w24
+impl Gateway {
+    /// Week 24: starts a gateway around a sequencer built elsewhere —
+    /// engines recovered from their journals, exchange ids continuing where
+    /// they stopped ([`Sequencer::with_engines`]), the exchange v2 hooks.
+    /// `config.instruments` and `config.cancel_on_disconnect` are not used:
+    /// the sequencer has its own. Otherwise as [`start_with`](Self::start_with).
+    pub fn start_sequencer(
+        config: GatewayConfig,
+        sequencer: Sequencer,
+    ) -> std::io::Result<Gateway> {
+        launch(config, sequencer)
+    }
+}
+
 // @student w13
 impl Drop for Gateway {
     fn drop(&mut self) {
@@ -305,6 +294,64 @@ impl Drop for Gateway {
 }
 
 // @student-begin w13
+/// Binds, starts the engine thread around `sequencer` and the runtime.
+fn launch(config: GatewayConfig, sequencer: Sequencer) -> std::io::Result<Gateway> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(config.io_threads.max(1))
+        .thread_name("gw-io")
+        .enable_io()
+        .enable_time()
+        .build()?;
+    let listener = runtime.block_on(bind(&config))?;
+    let local_addr = listener.local_addr()?;
+
+    let (inbound, rx) = mpsc::channel::<ToEngine>(config.inbound_capacity);
+    let ctx = Arc::new(Ctx {
+        auth: config.auth.clone(),
+        logon_timeout: config.logon_timeout,
+        read_buffer: config.read_buffer.max(64),
+        outbound_capacity: config.outbound_capacity.max(1),
+        tuning: config.tuning,
+        vectored: config.vectored_writes,
+        busy_reject: config.busy_reject,
+        clock: telemetry::Clock::global(),
+        next_session: AtomicU64::new(1),
+        sessions: Mutex::new(HashMap::new()),
+        stop: Stop::new(),
+        engine_done: AtomicBool::new(false),
+        inbound,
+        stats: Counters::default(),
+    });
+
+    let engine_token = CancelToken::new();
+    let engine = {
+        let ctx = Arc::clone(&ctx);
+        let token = engine_token.clone();
+        let idle = config.engine_idle;
+        let cpu = config.engine_cpu;
+        std::thread::Builder::new()
+            .name("gw-engine".into())
+            .spawn(move || {
+                if let Some(cpu) = cpu {
+                    if let Err(e) = sync::pin_current_thread(cpu) {
+                        eprintln!("gateway: cannot pin the engine thread to cpu {cpu}: {e}");
+                    }
+                }
+                engine_loop(rx, sequencer, &ctx, &token, idle)
+            })?
+    };
+
+    let acceptor = runtime.spawn(acceptor(listener, Arc::clone(&ctx)));
+    Ok(Gateway {
+        runtime: Some(runtime),
+        local_addr,
+        ctx,
+        acceptor: Some(acceptor),
+        engine: Some(engine),
+        engine_token,
+    })
+}
+
 /// Bytes of one encoded report frame, at most.
 const MAX_FRAME: usize = FRAME_HEADER_LEN + MAX_MSG_LEN;
 /// Reports a writer takes from its queue per write.
@@ -338,7 +385,10 @@ struct Ctx {
     outbound_capacity: usize,
     tuning: Option<SocketTuning>,
     vectored: bool,
-    epoch: Instant,
+    busy_reject: bool,
+    /// Receive timestamps (`rx_ns`) are read here: the process-wide clock
+    /// every stage stamps on (week 24 attributes latency from them).
+    clock: &'static telemetry::Clock,
     next_session: AtomicU64,
     /// Live connections' stop signals (touched at connect, disconnect and
     /// shutdown only).
@@ -353,9 +403,9 @@ struct Ctx {
 }
 
 impl Ctx {
-    /// Nanoseconds since the gateway started (monotonic).
+    /// Nanoseconds on `telemetry::Clock::global()` (monotonic).
     fn now_ns(&self) -> u64 {
-        self.epoch.elapsed().as_nanos() as u64
+        self.clock.now()
     }
 }
 
@@ -370,6 +420,7 @@ struct Counters {
     reports_out: AtomicU64,
     slow_consumers: AtomicU64,
     protocol_errors: AtomicU64,
+    busy_rejects: AtomicU64,
 }
 
 impl Counters {
@@ -389,6 +440,7 @@ impl Counters {
             reports_out: r(&self.reports_out),
             slow_consumers: r(&self.slow_consumers),
             protocol_errors: r(&self.protocol_errors),
+            busy_rejects: r(&self.busy_rejects),
         }
     }
 }
@@ -543,6 +595,56 @@ async fn to_engine(ctx: &Ctx, mut msg: ToEngine) -> bool {
     }
 }
 
+// @student-begin w24
+/// What [`admit_or_refuse`] did with a new order.
+enum Admit {
+    /// In the engine queue.
+    Queued,
+    /// The queue was full: the client got a busy reject.
+    Refused,
+    /// The engine thread has exited.
+    EngineGone,
+    /// The busy reject could not be queued either: close the session.
+    Close(CloseReason),
+}
+
+/// Week 24's edge admission: queue the order if there is room, otherwise
+/// answer `Rejected { BUSY }` on the session's own outbound queue at once
+/// (never waiting). A session whose outbound queue is full as well is not
+/// reading: it is cut as a slow consumer.
+fn admit_or_refuse(
+    ctx: &Ctx,
+    msg: ToEngine,
+    reply: &tokio_mpsc::Sender<Message>,
+    client_id: types::OrderId,
+) -> Admit {
+    if ctx.inbound.try_push(msg).is_ok() {
+        Counters::add(&ctx.stats.commands_in, 1);
+        return Admit::Queued;
+    }
+    if ctx.engine_done.load(Ordering::Acquire) {
+        return Admit::EngineGone;
+    }
+    Counters::add(&ctx.stats.busy_rejects, 1);
+    let refusal = Message::Event(Event::Rejected {
+        id: client_id,
+        reason: BUSY,
+    });
+    match reply.try_send(refusal) {
+        Ok(()) => {
+            Counters::add(&ctx.stats.reports_out, 1);
+            Admit::Refused
+        }
+        Err(tokio_mpsc::error::TrySendError::Full(_)) => {
+            Counters::add(&ctx.stats.slow_consumers, 1);
+            Admit::Close(CloseReason::SlowConsumer)
+        }
+        // The writer is gone (its socket failed): it set the reason.
+        Err(tokio_mpsc::error::TrySendError::Closed(_)) => Admit::Close(CloseReason::Shutdown),
+    }
+}
+// @student-end
+
 async fn reader(
     mut rd: OwnedReadHalf,
     out: tokio_mpsc::Sender<Message>,
@@ -555,6 +657,9 @@ async fn reader(
     let mut buf = vec![0u8; ctx.read_buffer];
     // Handed to the engine thread at logon (it then owns the only sender).
     let mut out = Some(out);
+    // Week 24: with busy rejects on, a second sender to answer a new order
+    // that finds the engine queue full.
+    let mut busy: Option<tokio_mpsc::Sender<Message>> = None;
     let logon_deadline = tokio::time::sleep(ctx.logon_timeout);
     tokio::pin!(logon_deadline);
 
@@ -591,6 +696,9 @@ async fn reader(
                         break 'conn CloseReason::DuplicateLogon;
                     };
                     Counters::add(&ctx.stats.logons, 1);
+                    if ctx.busy_reject {
+                        busy = Some(out.clone());
+                    }
                     let msg = ToEngine::Open {
                         session: id,
                         account: logon.account,
@@ -600,16 +708,28 @@ async fn reader(
                     to_engine(&ctx, msg).await
                 }
                 Action::Forward(cmd) => {
-                    Counters::add(&ctx.stats.commands_in, 1);
-                    to_engine(
-                        &ctx,
-                        ToEngine::Command {
-                            session: id,
-                            rx_ns,
-                            cmd,
-                        },
-                    )
-                    .await
+                    let msg = ToEngine::Command {
+                        session: id,
+                        rx_ns,
+                        cmd,
+                    };
+                    match (&busy, cmd) {
+                        (Some(reply), Command::New(order)) => {
+                            match admit_or_refuse(&ctx, msg, reply, order.id) {
+                                Admit::Queued => true,
+                                Admit::Refused => true,
+                                Admit::EngineGone => false,
+                                Admit::Close(reason) => {
+                                    stop.cancel(reason);
+                                    break 'conn stop.reason();
+                                }
+                            }
+                        }
+                        _ => {
+                            Counters::add(&ctx.stats.commands_in, 1);
+                            to_engine(&ctx, msg).await
+                        }
+                    }
                 }
                 Action::Disconnect(reason) => break 'conn reason,
                 Action::Ignore => true,
@@ -809,6 +929,8 @@ fn engine_loop(
             empty_polls = 0;
             continue;
         }
+        // Week 24: time-based stage work (an interval fsync).
+        seq.idle();
         if token.is_cancelled() && rx.is_empty() {
             break;
         }

@@ -69,6 +69,7 @@ dependencies = [
  "journal",
  "marketdata",
  "risk",
+ "sim",
  "sync",
  "telemetry",
  "tokio",
