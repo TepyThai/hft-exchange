@@ -19,7 +19,10 @@
 //! # Which queue?
 //!
 //! * One producer thread, one consumer thread, hot path: [`spsc`]. The
-//!   engine → market-data and engine → journal hand-offs.
+//!   natural shape for engine → market-data and engine → journal
+//!   hand-offs (the reference keeps those stages on the engine thread and
+//!   uses std channels between shards; swapping in this ring is a week 36
+//!   / 40 exercise).
 //! * Many producers (gateway sessions), one consumer (the engine): [`mpsc`].
 //! * Rare control messages where blocking is fine: [`spmc`].
 

@@ -342,7 +342,12 @@ impl<'a> PcapReader<'a> {
         } else {
             1_000_000
         };
-        if incl > MAX_RECORD || incl > orig as usize || frac >= frac_limit {
+        let snaplen = self.header.snaplen as usize;
+        if incl > MAX_RECORD
+            || incl > orig as usize
+            || (snaplen > 0 && incl > snaplen)
+            || frac >= frac_limit
+        {
             return fail(self, PcapError::BadRecord { offset: at });
         }
         let start = at + RECORD_HEADER_LEN;

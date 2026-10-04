@@ -89,10 +89,11 @@ impl Pipeline<Journal, Book> {
 impl<J: CommandLog, B: OrderBook> Pipeline<J, B> {
     /// Wires `journal` in front of `engine`. The journal's next sequence
     /// number must follow the engine's (both fresh, or both recovered to
-    /// the same point). The publisher starts from the engine's current
-    /// book: every resting order is announced as `Rested`, best first and
-    /// in time priority, so its first updates rebuild the book for a
-    /// listener starting from empty. O(resting orders).
+    /// the same point). The publisher is primed from the engine's current
+    /// book (every resting order fed as `Rested`, best first, in time
+    /// priority) so its depth matches the engine. The priming updates are
+    /// discarded, not published: after a restore or promotion, send
+    /// listeners `publisher().snapshot()` so they resync. O(resting orders).
     pub fn with_journal(journal: J, engine: Engine<B>) -> Result<Pipeline<J, B>, SeqMismatch> {
         let journal_next = journal.next_seq();
         if journal_next.0 != engine.seq().0 + 1 {
