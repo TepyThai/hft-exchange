@@ -9,12 +9,14 @@
 //! | 42 | [`mm`] | A [`MarketMaker`]: quotes around the microprice, inventory skew and limits, cancel/replace |
 //! | 43 | [`pairs`] | [`RollingStats`] (Welford), a [`PairsTrader`] on two cointegrated instruments ([`PairMarket`]) |
 //! | 44 | [`backtest`] | An event-driven [`Backtester`]: a recorded command log replayed through the engine, order latency, fill accounting, drawdown |
+//! | 48 | [`chaos`] | Deterministic fault injection: a seeded, replayable [`FaultPlan`], the [`ChaosLink`] injector, and scenarios that assert recovery without loss — feed loss ([`FeedSim`]), slow consumers ([`FanoutSim`]), leader failover ([`FailoverSim`]), a faulty venue ([`ChaosVenue`]) |
 //!
 //! Provided infrastructure (not exercises): [`flow`] generates synthetic
 //! order flow and [`live`] runs an engine + flow + human trader session for
 //! the WebAssembly page, the native terminal and the demo server.
 
 pub mod backtest;
+pub mod chaos;
 pub mod flow;
 pub mod live;
 pub mod micro;
@@ -23,6 +25,7 @@ pub mod pairs;
 pub mod scenario;
 
 pub use backtest::{BacktestConfig, BacktestReport, Backtester, Recording};
+pub use chaos::{ChaosLink, ChaosVenue, FailoverSim, FanoutSim, FaultPlan, FeedSim};
 pub use flow::{FlowConfig, OrderFlow};
 pub use live::{LiveSession, UserKind};
 pub use micro::{Markouts, QueuePosition, QueueTracker, TopOfBook};
