@@ -377,6 +377,8 @@ impl StampSlot {
 pub struct StageLog {
     inner: Arc<Mutex<LogState>>,
     capacity: usize,
+    /// Samples dropped while a reader held the lock (counted without it).
+    busy_dropped: Arc<AtomicU64>,
 }
 
 #[derive(Debug, Default)]
@@ -386,6 +388,49 @@ struct LogState {
     dropped: u64,
 }
 
+/// Per-stage and end-to-end p50/p99/p99.9 of `samples`, one line each, in
+/// nanoseconds. Built only on week 2's histogram and week 21's stamps, so
+/// it works from week 24 on; week 39's `Attribution` adds tail ownership
+/// and budgets on top. O(samples).
+pub fn summarize(samples: &[StageStamps]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let line = |out: &mut String, name: &str, h: &telemetry::Histogram| {
+        let _ = writeln!(
+            out,
+            "{name:>12} {:>9} {:>9} {:>9}",
+            h.percentile(0.50),
+            h.percentile(0.99),
+            h.percentile(0.999)
+        );
+    };
+    let _ = writeln!(
+        out,
+        "{:>12} {:>9} {:>9} {:>9}  ({} orders)",
+        "stage",
+        "p50",
+        "p99",
+        "p99.9",
+        samples.len()
+    );
+    for stage in telemetry::Stage::ALL {
+        let mut h = telemetry::Histogram::new();
+        samples
+            .iter()
+            .filter_map(|s| s.interval(stage))
+            .for_each(|v| h.record(v));
+        if h.count() > 0 {
+            line(&mut out, stage.name(), &h);
+        }
+    }
+    let mut total = telemetry::Histogram::new();
+    samples.iter().for_each(|s| total.record(s.total()));
+    if total.count() > 0 {
+        line(&mut out, "end to end", &total);
+    }
+    out
+}
+
 impl StageLog {
     /// A log keeping the last `capacity` samples (at least 1); 64 bytes
     /// each, allocated as they arrive.
@@ -393,6 +438,7 @@ impl StageLog {
         StageLog {
             inner: Arc::new(Mutex::new(LogState::default())),
             capacity: capacity.max(1),
+            busy_dropped: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -413,8 +459,9 @@ impl StageLog {
                 if batch.len() > self.capacity {
                     let excess = batch.len() - self.capacity;
                     batch.drain(..excess);
-                    // Counted when the lock is next free.
-                    self.inner.lock().unwrap_or_else(|e| e.into_inner()).dropped += excess as u64;
+                    // Never wait for the reader: count without the lock.
+                    self.busy_dropped
+                        .fetch_add(excess as u64, Ordering::Relaxed);
                 }
             }
         }
@@ -467,7 +514,12 @@ impl StageLog {
 
     /// Samples dropped because the log was full (or busy and full).
     pub fn dropped(&self) -> u64 {
-        self.lock().dropped
+        self.lock().dropped + self.busy_dropped.load(Ordering::Relaxed)
+    }
+
+    /// [`summarize`] over the samples kept.
+    pub fn summary(&self) -> String {
+        summarize(&self.samples())
     }
 }
 

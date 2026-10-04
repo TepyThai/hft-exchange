@@ -142,7 +142,7 @@ fn bench_e2e_latency() -> Report {
     let samples = exchange.stage_log().samples_since(r.measure_start_ns);
     eprint!(
         "server stages, ns:\n{}",
-        Attribution::from_samples(&samples)
+        gateway::exchange::summarize(&samples)
     );
     let report = exchange.shutdown(Duration::from_secs(10));
     drop(dir);

@@ -4,7 +4,7 @@
 //! `sessions` client connections, each its own trader population
 //! (`sim::OrderFlow`, the w23-style synthetic flow: passive and aggressive
 //! limits, IOC and market orders, cancels of its own resting orders). The
-//! commands follow one fixed schedule ([`telemetry::OpenLoop`]): command
+//! commands follow one fixed schedule (the same as week 25's `telemetry::OpenLoop`): command
 //! `i` is due at `start + i / rate`, round-robin over the sessions, whether
 //! or not earlier ones were answered. Every new order's latency is measured
 //! from its **intended** send time to its first response (`Accepted` or
@@ -26,7 +26,7 @@ use sim::flow::{FlowConfig, OrderFlow};
 use std::io::{self, Write};
 use std::net::SocketAddr;
 use std::time::Duration;
-use telemetry::{Clock, Histogram, OpenLoop};
+use telemetry::{Clock, Histogram};
 use types::{Command, Event};
 use wire::{encode_frame, Message, FRAME_HEADER_LEN, MAX_MSG_LEN};
 
@@ -154,7 +154,9 @@ impl LoadResult {
 pub fn run(addr: SocketAddr, cfg: &LoadConfig) -> io::Result<LoadResult> {
     let sessions = cfg.sessions.max(1);
     let total = cfg.warmup + cfg.commands;
-    let schedule = OpenLoop::at_rate(cfg.rate.max(1), cfg.commands).with_warmup(cfg.warmup);
+    let schedule = Schedule {
+        per_sec: cfg.rate.max(1),
+    };
     let clock = *Clock::global();
     let mut clients = Vec::with_capacity(sessions);
     for k in 0..sessions {
@@ -241,10 +243,24 @@ pub fn run(addr: SocketAddr, cfg: &LoadConfig) -> io::Result<LoadResult> {
     Ok(result)
 }
 
+/// Command `i` (warm-up included) is due at `start + i × 1e9 / rate`,
+/// computed exactly: the same open-loop schedule as week 25's `OpenLoop`,
+/// kept here so this week-24 tool runs before week 25 is written.
+#[derive(Clone, Copy)]
+struct Schedule {
+    per_sec: u64,
+}
+
+impl Schedule {
+    fn intended_start(&self, start: u64, i: u64) -> u64 {
+        start + (i as u128 * 1_000_000_000 / self.per_sec as u128) as u64
+    }
+}
+
 /// The shared schedule of one run.
 #[derive(Clone, Copy)]
 struct Run {
-    schedule: OpenLoop,
+    schedule: Schedule,
     start: u64,
     total: u64,
     warmup: u64,

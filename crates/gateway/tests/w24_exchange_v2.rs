@@ -911,25 +911,24 @@ fn w24_load_test_reports_stages_and_end_to_end() {
         "{} samples for {measured} orders",
         samples.len()
     );
-    let a = telemetry::Attribution::from_samples(&samples);
-    assert_eq!(a.samples(), samples.len() as u64);
-    for stage in [
-        Stamp::Gateway,
-        Stamp::Risk,
-        Stamp::Match,
-        Stamp::Journal,
-        Stamp::Publish,
-        Stamp::Ack,
-    ] {
-        assert_eq!(
-            a.stage(stage).map(|h| h.count()),
-            Some(a.samples()),
-            "{stage:?}"
-        );
+    // Every sample carries every stage (week 21's stamps; week 39 turns
+    // them into attribution), and the server's end to end is part of the
+    // client's.
+    let mut server_e2e = telemetry::Histogram::new();
+    for s in &samples {
+        for stage in [
+            Stamp::Gateway,
+            Stamp::Risk,
+            Stamp::Match,
+            Stamp::Journal,
+            Stamp::Publish,
+            Stamp::Ack,
+        ] {
+            assert!(s.interval(stage).is_some(), "{stage:?} missing");
+        }
+        server_e2e.record(s.total());
     }
-    assert!(a.dominant_stage().is_some());
-    // The server's end to end is part of the client's.
-    assert!(a.end_to_end().percentile(0.5) <= r.e2e.percentile(0.5));
+    assert!(server_e2e.percentile(0.5) <= r.e2e.percentile(0.5));
     assert_eq!(ex.stats().busy_rejects, r.busy);
     assert!(ex.shutdown(TIMEOUT).is_clean());
 }
