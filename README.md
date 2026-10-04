@@ -142,7 +142,10 @@ else's. CI runners are noisy shared machines, so CI reports tests only by
 default.
 
 Publish numbers from data, not by hand. The report renders as a Markdown
-table with its machine, commit and sample counts:
+table with its machine, commit and sample counts.
+[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) is the reference implementation's
+run on a busy shared 64-thread server (an AMD EPYC 7543P), so treat its
+tails as pessimistic:
 
 ```sh
 cargo xtask report --markdown BENCHMARKS.md              # run tests + benchmarks, write both
