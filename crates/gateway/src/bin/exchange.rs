@@ -1,5 +1,9 @@
-//! The exchange binary (week 22): load and validate `exchange.toml`, then
-//! run the gateway, the pre-trade gate and the engine thread.
+//! The exchange binary (weeks 22 and 24): load and validate
+//! `exchange.toml`, then run exchange v2 — the gateway, the pre-trade gate,
+//! the engine thread with its journals (`[journal] path` and `fsync`) and
+//! the market-data fan-out (`[marketdata]`, served over WebSocket when
+//! `listen` is set). On start it recovers every instrument's book from its
+//! journal; on shutdown it drains, syncs, and prints where the time went.
 //!
 //! ```text
 //! exchange [--config PATH] [--check-config | --print-config] [--run-for SECS]
@@ -16,7 +20,7 @@
 //!
 //! Exit codes: 0 ok, 1 runtime failure, 2 configuration or usage error.
 
-use gateway::{ExchangeConfig, Gateway, Hooks, NoStage};
+use gateway::{ExchangeConfig, ExchangeV2, V2Config};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
@@ -84,18 +88,34 @@ fn main() -> ExitCode {
         cfg.instruments.len(),
         cfg.gateway.listen
     );
-    let hooks = Hooks {
-        pretrade: Box::new(cfg.risk_gate()),
-        stage: Box::new(NoStage),
-    };
-    let gw = match Gateway::start_with(cfg.gateway_config(), hooks) {
-        Ok(gw) => gw,
+    let exchange = match ExchangeV2::start(V2Config::from_config(&cfg), cfg.risk_gate()) {
+        Ok(x) => x,
         Err(e) => {
-            eprintln!("cannot start the gateway: {e}");
+            eprintln!("cannot start: {e}");
             return ExitCode::FAILURE;
         }
     };
-    println!("listening on {}", gw.local_addr());
+    for r in exchange.recovery() {
+        println!(
+            "instrument {}: journal {}: {} command(s) replayed, state {:016x}{}",
+            r.instrument.0,
+            gateway::journal_path(&cfg.journal.path, r.instrument).display(),
+            r.replayed,
+            r.state_hash,
+            match &r.torn_tail {
+                Some(t) => format!(", torn tail of {} byte(s) cut", t.dropped_bytes),
+                None => String::new(),
+            }
+        );
+    }
+    for (instrument, addr) in exchange.md_addrs() {
+        println!("market data for instrument {}: ws://{addr}/", instrument.0);
+    }
+    println!(
+        "order entry on {}, fsync {}",
+        exchange.local_addr(),
+        cfg.journal.fsync
+    );
     let start = Instant::now();
     loop {
         std::thread::sleep(Duration::from_millis(200));
@@ -103,8 +123,17 @@ fn main() -> ExitCode {
             break;
         }
     }
-    let report = gw.shutdown(Duration::from_secs(10));
-    println!("shut down: {report:?}");
+    let attribution = exchange.stage_log().attribution();
+    let stats = exchange.stats();
+    let report = exchange.shutdown(Duration::from_secs(10));
+    println!("shut down: {:?}", report.gateway);
+    println!("{:?}; busy rejects {}", report.pipeline, stats.busy_rejects);
+    if attribution.samples() > 0 {
+        print!(
+            "where the time went, ns (last {} orders):\n{attribution}",
+            attribution.samples()
+        );
+    }
     if report.is_clean() {
         ExitCode::SUCCESS
     } else {

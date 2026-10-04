@@ -2,12 +2,25 @@
 
 use benchkit::{Histogram, Report, Unit};
 use gateway::client::Client;
+use gateway::config::Fsync;
 use gateway::io::{echo_loop, EchoLoad, EchoOptions, EchoStats, IoBackend, RingBackend};
+use gateway::loadgen::{self, LoadConfig};
 use gateway::pingpong::{EchoServer, PingClient, RecvMode};
+use gateway::session::{Action, Auth, Session, SessionId};
 use gateway::SocketTuning;
-use gateway::{EngineIdle, Gateway, GatewayConfig};
+use gateway::{
+    assemble, EngineIdle, ExchangeV2, Gateway, GatewayConfig, JournalBackend, MemJournals,
+    RiskGate, V2Config,
+};
+use risk::{BucketConfig, Limits};
+use sim::flow::{FlowConfig, OrderFlow};
 use std::time::{Duration, Instant};
-use types::{Event, NewOrder, OrderId, Side, TimeInForce};
+use telemetry::{Attribution, Clock};
+use types::{AccountId, Event, NewOrder, OrderId, Qty, Side, TimeInForce};
+use wire::{encode_frame, FrameDecoder, Logon, Message, FRAME_HEADER_LEN, MAX_MSG_LEN};
+
+const W24_LABEL: &str = "Order in → ack out, loopback, under load";
+const W39_LABEL: &str = "Order in → ack, in-process pipeline";
 
 fn main() {
     benchkit::run(&[
@@ -21,12 +34,187 @@ fn main() {
             "TCP ping-pong, loopback",
             bench_pingpong,
         ),
+        ("w24.e2e_latency", W24_LABEL, bench_e2e_latency),
         (
             "w32.batched_io",
             "Messages per wakeup-batched loop",
             bench_batched_io,
         ),
+        ("w39.tick_to_ack", W39_LABEL, bench_tick_to_ack),
     ]);
+}
+
+/// Latency report in `unit` from a telemetry histogram of nanoseconds
+/// (value: p50).
+fn latency_report(id: &str, label: &str, unit: Unit, h: &telemetry::Histogram) -> Report {
+    let scale = match unit {
+        Unit::Us => 1e3,
+        _ => 1.0,
+    };
+    let q = |p: f64| h.percentile(p) as f64 / scale;
+    Report {
+        id: id.into(),
+        label: label.into(),
+        unit,
+        value: q(0.5),
+        p50: Some(q(0.5)),
+        p99: Some(q(0.99)),
+        p999: Some(q(0.999)),
+        max: Some(h.max() as f64 / scale),
+        samples: h.count(),
+    }
+}
+
+/// A directory removed when dropped, also while unwinding from a panic.
+struct TempDir(std::path::PathBuf);
+
+impl TempDir {
+    fn new(path: std::path::PathBuf) -> TempDir {
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).expect("temp dir");
+        TempDir(path)
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Pre-trade limits that bind like production ones but never reject the
+/// benchmark flow; no throttle.
+fn bench_gate() -> RiskGate {
+    let limits = Limits {
+        max_order_qty: Qty(1_000_000),
+        max_notional: 1 << 60,
+        max_position: Qty(1 << 40),
+        ..Limits::UNLIMITED
+    };
+    RiskGate::new(limits, BucketConfig::UNLIMITED, BucketConfig::UNLIMITED)
+}
+
+/// Exchange v2 under a moderate open-loop load over loopback TCP: 2
+/// client sessions (busy-polling generator threads) offering 50 000
+/// commands/s of the w23-style flow (about two thirds new orders, the rest
+/// cancels; some IOC and market orders), 20 000 warm-up then 100 000
+/// measured commands. The exchange runs `RiskGate` (throttles off), file
+/// journals written every batch without fsync (`Fsync::Never`: durable
+/// against a process crash) on tmpfs (`/dev/shm`) where there is one — the
+/// write syscalls stay, the device's writeback stalls do not (with fsync
+/// on, this would measure the disk: `loadtest --fsync always` does) — a
+/// busy-polling engine thread and 2 Tokio workers. Value: client-measured
+/// intended send → first response of every measured new order. Prints the
+/// load summary and the server's stage attribution of the same orders.
+fn bench_e2e_latency() -> Report {
+    const RATE: u64 = 50_000;
+    let shm = std::path::Path::new("/dev/shm");
+    let root = if shm.is_dir() {
+        shm.to_path_buf()
+    } else {
+        std::env::temp_dir()
+    };
+    let dir = TempDir::new(root.join(format!("hft-bench-w24-{}", std::process::id())));
+    let config = V2Config {
+        gateway: GatewayConfig {
+            engine_idle: EngineIdle::BusyPoll,
+            io_threads: 2,
+            cancel_on_disconnect: true,
+            ..GatewayConfig::default()
+        },
+        journal: JournalBackend::File(dir.0.join("journal.bin")),
+        fsync: Fsync::Never,
+        stage_samples: 1 << 18,
+        ..V2Config::in_memory(GatewayConfig::default(), MemJournals::new())
+    };
+    let exchange = ExchangeV2::start(config, bench_gate()).expect("exchange v2 starts");
+    let load = LoadConfig {
+        warmup: 20_000,
+        ..LoadConfig::new(RATE, 100_000)
+    };
+    let r = loadgen::run(exchange.local_addr(), &load).expect("load run");
+    eprintln!("{}", r.summary());
+    eprintln!(
+        "achieved {:.0} orders/s; busy rejects {}",
+        r.achieved_rate(),
+        exchange.stats().busy_rejects
+    );
+    let samples = exchange.stage_log().samples_since(r.measure_start_ns);
+    eprint!(
+        "server stages, ns:\n{}",
+        Attribution::from_samples(&samples)
+    );
+    let report = exchange.shutdown(Duration::from_secs(10));
+    drop(dir);
+    assert!(report.is_clean(), "{report:?}");
+    assert_eq!(r.unanswered, 0, "{}", r.summary());
+    latency_report("w24.e2e_latency", W24_LABEL, Unit::Us, &r.e2e)
+}
+
+/// Exchange v2's order path in process, one order per batch, no sockets:
+/// the session decodes the frame, the engine thread's sequencer runs
+/// `RiskGate` (limits on, throttles off), appends to the journal (in
+/// memory), matches, updates the L2 publisher, commits (an in-memory
+/// "fsync") and publishes to the rings. 200 000 commands of the w23-style
+/// flow after 20 000 warm-up ones; every new order is stamped on the TSC
+/// clock (Ingress before the decode, Ack at release). Value: Ingress → Ack
+/// of the new orders. Prints the attribution table.
+fn bench_tick_to_ack() -> Report {
+    const WARMUP: u64 = 20_000;
+    const COMMANDS: u64 = 200_000;
+    let config = V2Config {
+        fsync: Fsync::Always,
+        stage_samples: COMMANDS as usize,
+        ..V2Config::in_memory(GatewayConfig::default(), MemJournals::new())
+    };
+    let mut x = assemble(&config, bench_gate()).expect("assemble");
+    let sid = SessionId(1);
+    let mut session = Session::new(sid);
+    let auth = Auth::Open;
+    let mut frame = vec![0u8; FRAME_HEADER_LEN + MAX_MSG_LEN];
+    let mut decoder = FrameDecoder::default();
+    let logon = Message::Logon(Logon {
+        account: AccountId(1),
+        token: 0,
+    });
+    let n = encode_frame(&logon, &mut frame);
+    let mut input = &frame[..n];
+    let payload = decoder.next_frame(&mut input).unwrap().unwrap();
+    assert!(matches!(session.on_frame(payload, &auth), Action::Logon(_)));
+    x.sequencer.open(sid, AccountId(1), &mut |_, _| {});
+
+    let clock = Clock::global();
+    let mut flow = OrderFlow::new(FlowConfig::default(), 39);
+    let mut reports: Vec<Event> = Vec::with_capacity(64);
+    for i in 0..WARMUP + COMMANDS {
+        for ev in reports.drain(..) {
+            flow.on_event(&ev);
+        }
+        if i == WARMUP {
+            x.log.clear();
+        }
+        let n = encode_frame(&Message::from(flow.next_command()), &mut frame);
+        let rx = clock.now();
+        let mut input = &frame[..n];
+        let payload = decoder.next_frame(&mut input).unwrap().unwrap();
+        let Action::Forward(cmd) = session.on_frame(payload, &auth) else {
+            panic!("the session forwards orders")
+        };
+        x.sequencer.command(sid, rx, &cmd, &mut |_, m| {
+            if let Message::Event(e) = m {
+                reports.push(e);
+            }
+        });
+        x.sequencer.flush();
+    }
+    let attribution = Attribution::from_samples(&x.log.samples());
+    eprint!("{attribution}");
+    latency_report(
+        "w39.tick_to_ack",
+        W39_LABEL,
+        Unit::Ns,
+        attribution.end_to_end(),
+    )
 }
 
 /// One logged-on client sends an IOC order into an empty book and waits

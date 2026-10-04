@@ -12,6 +12,7 @@
 //!              → Stage::on_events → PreTrade::on_event             │
 //!              → OrderRouter (client ids) ─▶ batch outbox ◀────────┘
 //!     end of batch: Stage::flush ─▶ per-session queues ─▶ writers
+//!     queue empty:  Stage::on_idle (week 24: an interval fsync)
 //! ```
 
 use crate::session::SessionId;
@@ -24,9 +25,11 @@ use types::{Command, Event, InstrumentId, NewOrder, Price, RejectReason};
 /// the client gets `Rejected` with the returned reason.
 pub trait PreTrade: Send {
     /// Checks `order` (exchange order id already assigned, account set by
-    /// the session) received on `session` at `rx_ns` (nanoseconds on the
-    /// gateway's monotonic clock). `reference` is the engine's reference
-    /// price for the instrument (last trade, else the configured one).
+    /// the session) received on `session` at `rx_ns` (nanoseconds on
+    /// `telemetry::Clock::global()`, read when the session's socket read
+    /// returned — week 24 stamps it as the order's `Ingress`). `reference`
+    /// is the engine's reference price for the instrument (last trade, else
+    /// the configured one).
     ///
     /// `Ok` means the order **will** be sent to the engine: record it as
     /// open (check-and-reserve), so the next check sees it.
@@ -88,6 +91,12 @@ pub trait Stage: Send {
     /// released to the sessions when this returns (fsync here for
     /// durable-before-ack).
     fn flush(&mut self) {}
+
+    /// The engine thread polled an empty queue (week 24). Time-based work
+    /// goes here — an interval fsync must not wait for the next order.
+    /// Called on every empty poll, so keep it to a branch when there is
+    /// nothing to do.
+    fn on_idle(&mut self) {}
 }
 
 /// No stage: reports go straight to the sessions.

@@ -38,5 +38,5 @@ FROM gcr.io/distroless/cc-debian12:nonroot
 COPY --from=build /usr/local/bin/exchange /usr/local/bin/exchange
 COPY exchange.toml /etc/hft/exchange.toml
 ENV HFT_JOURNAL_PATH=/tmp/hft-journal.bin
-EXPOSE 9000
+EXPOSE 9000 9001 9002
 ENTRYPOINT ["/usr/local/bin/exchange", "--config", "/etc/hft/exchange.toml"]
