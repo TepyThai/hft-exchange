@@ -123,15 +123,16 @@ fn main() -> ExitCode {
             break;
         }
     }
-    let attribution = exchange.stage_log().attribution();
+    let samples = exchange.stage_log().samples();
     let stats = exchange.stats();
     let report = exchange.shutdown(Duration::from_secs(10));
     println!("shut down: {:?}", report.gateway);
     println!("{:?}; busy rejects {}", report.pipeline, stats.busy_rejects);
-    if attribution.samples() > 0 {
+    if !samples.is_empty() {
         print!(
-            "where the time went, ns (last {} orders):\n{attribution}",
-            attribution.samples()
+            "where the time went, ns (last {} orders):\n{}",
+            samples.len(),
+            gateway::exchange::summarize(&samples)
         );
     }
     if report.is_clean() {

@@ -189,9 +189,8 @@ fn main() -> ExitCode {
                 );
                 let samples = exchange.stage_log().samples_since(r.measure_start_ns);
                 print!(
-                    "server stages, ns ({} orders):\n{}",
-                    samples.len(),
-                    telemetry::Attribution::from_samples(&samples)
+                    "server stages, ns:\n{}",
+                    gateway::exchange::summarize(&samples)
                 );
             }
             Err(e) => {
