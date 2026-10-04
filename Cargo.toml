@@ -24,8 +24,19 @@ risk = { path = "crates/risk" }
 gateway = { path = "crates/gateway" }
 sim = { path = "crates/sim" }
 
+# The only external dependency in the curriculum crates: the gateway's async
+# runtime (week 13). Only the features the gateway uses.
+tokio = { version = "1.47", default-features = false, features = ["rt", "rt-multi-thread", "net", "io-util", "time", "sync", "macros"] }
+
 # Latency work wants the whole program optimized together and readable
 # profiles (line tables) without slowing anything down.
+#
+# No `panic = "abort"` (week 22): `xtest` and `bench` inherit this profile,
+# the week-3 task-set tests check that a panicking thread is reported
+# rather than taking the process down, and the gateway (the `exchange`
+# binary) relies on unwinding so a panicking session task is dropped while
+# the exchange keeps running. An engine-only binary that wants abort gets
+# its own profile (`[profile.release-abort]`, `inherits = "release"`).
 [profile.release]
 lto = "fat"
 codegen-units = 1

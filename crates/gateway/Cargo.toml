@@ -15,6 +15,7 @@ marketdata = { workspace = true }
 wire = { workspace = true }
 fix = { workspace = true }
 risk = { workspace = true }
+tokio = { workspace = true }
 
 [dev-dependencies]
 benchkit = { workspace = true }
