@@ -8,8 +8,8 @@ use marketdata::feed::{
     MAX_UPDATES_PER_PACKET,
 };
 use marketdata::pcap::{
-    internet_checksum, parse_udp, udp_frame, PacketError, PcapError, PcapReader, PcapWriter,
-    PCAP_MAGIC_MICROS,
+    internet_checksum, parse_udp, udp_checksum, udp_frame, PacketError, PcapError, PcapReader,
+    PcapWriter, PCAP_MAGIC_MICROS,
 };
 use marketdata::replay::{FEED_SOURCE, INCREMENTAL_GROUP, SNAPSHOT_GROUP};
 use marketdata::{
@@ -121,6 +121,42 @@ fn w46_pcap_round_trip() {
 
 // ---------------------------------------------------------------------------
 // The feed's wire format
+
+#[test]
+fn w46_udp_checksum_rejects_any_flipped_payload_bit() {
+    use std::net::SocketAddrV4;
+    let src = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 40_001);
+    let dst = SocketAddrV4::new(Ipv4Addr::new(239, 1, 1, 1), 30_001);
+    let payload: Vec<u8> = (0..61u8).map(|i| i.wrapping_mul(37)).collect();
+    let mut frame = Vec::new();
+    udp_frame(src, dst, 7, &payload, &mut frame);
+    let udp_at = frame.len() - payload.len() - 8;
+    // The written checksum verifies (RFC 768: sum over pseudo-header + segment).
+    assert_ne!(
+        u16::from_be_bytes([frame[udp_at + 6], frame[udp_at + 7]]),
+        0
+    );
+    assert_eq!(udp_checksum(*src.ip(), *dst.ip(), &frame[udp_at..]), 0);
+    assert_eq!(parse_udp(&frame).unwrap().payload, &payload[..]);
+    // Every single-bit flip in the payload is caught, so a corrupted price
+    // can never be applied to a book.
+    for i in udp_at + 8..frame.len() {
+        for bit in 0..8 {
+            let mut bad = frame.clone();
+            bad[i] ^= 1 << bit;
+            assert_eq!(
+                parse_udp(&bad).unwrap_err(),
+                PacketError::BadChecksum,
+                "byte {i} bit {bit}"
+            );
+        }
+    }
+    // A zero checksum means "not computed" and is accepted as-is.
+    let mut unchecked = frame.clone();
+    unchecked[udp_at + 6] = 0;
+    unchecked[udp_at + 7] = 0;
+    assert_eq!(parse_udp(&unchecked).unwrap().payload, &payload[..]);
+}
 
 #[test]
 fn w46_feed_packet_layout_is_exact_and_strict() {

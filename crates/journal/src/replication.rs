@@ -16,8 +16,11 @@
 //! appended and applied; an older one is a duplicate (ignored, re-acked); a
 //! newer one or a damaged one means frames are missing, so the standby asks
 //! for a resend from `next_seq` — once, not for every early frame — and
-//! drops frames until it arrives. Heartbeats carry the primary's
-//! `next_seq`, which exposes a lost *last* frame.
+//! drops frames until it arrives. If the request itself is lost, it asks
+//! again once a quarter of the lease has passed without the resend
+//! arriving, so a steady stream of new frames cannot stall replication.
+//! Heartbeats carry the primary's `next_seq`, which exposes a lost *last*
+//! frame.
 //!
 //! # Leases: one leader at a time
 //!
@@ -368,8 +371,9 @@ impl<C: Clock> Primary<C> {
     }
 
     /// Sends a heartbeat (renewing the lease once acknowledged, and
-    /// exposing a lost last frame). Call it when idle, well within the
-    /// lease.
+    /// exposing a lost last frame). Call it periodically, well within the
+    /// lease — when idle, and also under load, since it is the cheapest way
+    /// to expose missing frames quickly.
     pub fn heartbeat(&mut self) -> Result<(), ReplicationError> {
         self.poll()?;
         let next_seq = self.journal.next_seq();
@@ -475,6 +479,8 @@ pub struct Standby<M, C = SystemClock> {
     last_grant: u64,
     /// A resend from this sequence number is outstanding.
     resend_from: Option<Seq>,
+    /// Clock reading when the outstanding resend was last requested.
+    resend_at: u64,
     stats: StandbyStats,
 }
 
@@ -493,11 +499,16 @@ impl<M: StateMachine, C: Clock> Standby<M, C> {
     }
 
     /// Asks for everything from `next_seq` on, unless that request is
-    /// already outstanding (`force`: ask again anyway).
+    /// already outstanding and recent (`force`: ask again anyway). A request
+    /// unanswered for a quarter of the lease is repeated: it may have been
+    /// lost, and waiting for a heartbeat would stall replication under load.
     fn request_resend(&mut self, force: bool) {
         let from = self.journal.next_seq();
-        if force || self.resend_from != Some(from) {
+        let now = self.clock.now_ns();
+        let stale = now.saturating_sub(self.resend_at) >= (self.lease_ns / 4).max(1);
+        if force || self.resend_from != Some(from) || stale {
             self.resend_from = Some(from);
+            self.resend_at = now;
             self.stats.resend_requests += 1;
             let _ = self.link.tx.send(ToPrimary::Resend { from });
         }
@@ -525,6 +536,7 @@ impl<M: StateMachine, C: Clock> Standby<M, C> {
             lease_ns: duration_ns(lease),
             last_grant: 0,
             resend_from: None,
+            resend_at: 0,
             stats: StandbyStats::default(),
         };
         s.grant();

@@ -2,8 +2,8 @@
 //! gaps, duplicates and damage, and the leader lease.
 
 use journal::{
-    link, Crc32, FrameError, Handled, Journal, ManualClock, Primary, ReplicationError, Standby,
-    StandbyLink, StateMachine, ToStandby, FRAME_HEADER_LEN,
+    link, Crc32, FrameBuf, FrameError, Handled, Journal, ManualClock, Primary, ReplicationError,
+    Standby, StandbyLink, StateMachine, ToPrimary, ToStandby, FRAME_HEADER_LEN,
 };
 use std::sync::mpsc;
 use std::time::Duration;
@@ -348,4 +348,65 @@ fn w20_lease_decides_who_leads() {
     let (j, m) = standby.promote().expect("lease over");
     assert_eq!(j.last_seq(), Some(Seq(2)));
     assert_eq!(m, digest_of(&[cmd, cmd]));
+}
+
+#[test]
+fn w20_lost_resend_request_is_repeated_under_load() {
+    // The test plays the primary and the network: it sees every request
+    // and decides what reaches the standby.
+    let lease = Duration::from_micros(400);
+    let quarter = (lease.as_nanos() / 4) as u64;
+    let clock = ManualClock::new(0);
+    let (plink, slink) = link();
+    let mut standby = Standby::new(
+        Journal::new(),
+        Digest::default(),
+        slink,
+        clock.clone(),
+        lease,
+    );
+    let cmds = commands(48, 6);
+    let mut source = Journal::new();
+    cmds.iter().for_each(|c| {
+        source.append(c);
+    });
+    let frames = frames_of(&source);
+    let frame = |i: usize| ToStandby::Frame(FrameBuf::copy_from(&frames[i]).unwrap());
+    let resends = |rx: &std::sync::mpsc::Receiver<ToPrimary>| -> Vec<Seq> {
+        rx.try_iter()
+            .filter_map(|m| match m {
+                ToPrimary::Resend { from } => Some(from),
+                _ => None,
+            })
+            .collect()
+    };
+
+    assert_eq!(standby.handle(frame(0)), Handled::Applied(Seq(1)));
+    // Frame 2 is lost; frame 3 reveals the gap and the standby asks once.
+    assert!(matches!(standby.handle(frame(2)), Handled::Rejected(_)));
+    assert_eq!(resends(&plink.rx), vec![Seq(2)]);
+    // That request is lost too. More early frames within a quarter lease
+    // must not flood the primary with duplicates…
+    clock.advance(quarter - 1);
+    assert!(matches!(standby.handle(frame(3)), Handled::Rejected(_)));
+    assert!(resends(&plink.rx).is_empty());
+    // …but once a quarter lease passes without the resend, it asks again,
+    // with no heartbeat needed.
+    clock.advance(1);
+    assert!(matches!(standby.handle(frame(4)), Handled::Rejected(_)));
+    assert_eq!(resends(&plink.rx), vec![Seq(2)]);
+    // The resend arrives and replication catches up.
+    for i in 1..frames.len() {
+        assert_eq!(
+            standby.handle(frame(i)),
+            Handled::Applied(Seq(i as u64 + 1))
+        );
+    }
+    assert_eq!(standby.applied_seq(), Seq(6));
+    clock.advance(lease.as_nanos() as u64 + 1);
+    let (journal, machine) = standby
+        .promote()
+        .unwrap_or_else(|_| panic!("the lease has expired"));
+    assert_eq!(journal.as_bytes(), source.as_bytes());
+    assert_eq!(machine, digest_of(&cmds));
 }

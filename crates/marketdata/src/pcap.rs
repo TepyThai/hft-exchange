@@ -106,7 +106,7 @@ pub enum PacketError {
     NotIpv4(u16),
     /// IP version is not 4 or the header length is invalid.
     BadIpHeader,
-    /// The IPv4 header checksum does not verify.
+    /// The IPv4 header checksum or the UDP checksum does not verify.
     BadChecksum,
     /// A fragment: feed packets are never fragmented.
     Fragmented,
@@ -133,6 +133,35 @@ pub struct UdpDatagram<'a> {
 pub fn internet_checksum(bytes: &[u8]) -> u16 {
     let mut sum = 0u32;
     let mut words = bytes.chunks_exact(2);
+    for w in &mut words {
+        sum += u16::from_be_bytes([w[0], w[1]]) as u32;
+    }
+    if let [last] = words.remainder() {
+        sum += (*last as u32) << 8;
+    }
+    while sum > 0xFFFF {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+/// The UDP checksum (RFC 768) of `udp` (header + payload) sent from `src`
+/// to `dst`: the one's-complement sum over the IPv4 pseudo-header and the
+/// segment. Computing it with the checksum field zeroed gives the value to
+/// write (send 0xFFFF in place of 0, which means "no checksum"); over a
+/// received segment with its checksum in place it is 0 when intact.
+/// O(len), no allocation.
+pub fn udp_checksum(src: Ipv4Addr, dst: Ipv4Addr, udp: &[u8]) -> u16 {
+    let mut sum = 0u32;
+    for w in src
+        .octets()
+        .chunks_exact(2)
+        .chain(dst.octets().chunks_exact(2))
+    {
+        sum += u16::from_be_bytes([w[0], w[1]]) as u32;
+    }
+    sum += 17 + udp.len() as u32;
+    let mut words = udp.chunks_exact(2);
     for w in &mut words {
         sum += u16::from_be_bytes([w[0], w[1]]) as u32;
     }
@@ -184,8 +213,15 @@ pub fn udp_frame(
     out.extend_from_slice(&src.port().to_be_bytes());
     out.extend_from_slice(&dst.port().to_be_bytes());
     out.extend_from_slice(&((UDP_LEN + payload.len()) as u16).to_be_bytes());
+    let udp_start = out.len() - 6;
     out.extend_from_slice(&[0, 0]);
     out.extend_from_slice(payload);
+    // A flipped bit in a price must not decode as a valid update.
+    let udp_sum = match udp_checksum(*src.ip(), *dst.ip(), &out[udp_start..]) {
+        0 => 0xFFFF,
+        c => c,
+    };
+    out[udp_start + 6..udp_start + 8].copy_from_slice(&udp_sum.to_be_bytes());
 }
 
 /// Writes a little-endian, nanosecond-resolution Ethernet capture.
@@ -445,6 +481,10 @@ pub fn parse_udp(frame: &[u8]) -> Result<UdpDatagram<'_>, PacketError> {
     let udp_len = be16(udp, 4) as usize;
     if udp_len != udp.len() {
         return Err(PacketError::BadUdpLength);
+    }
+    // 0 means the sender computed no checksum; otherwise it must verify.
+    if be16(udp, 6) != 0 && udp_checksum(addr(12), addr(16), udp) != 0 {
+        return Err(PacketError::BadChecksum);
     }
     Ok(UdpDatagram {
         src: SocketAddrV4::new(addr(12), be16(udp, 0)),
