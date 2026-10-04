@@ -186,8 +186,9 @@ fn key(r: &Regression) -> (&str, Option<Metric>) {
 ///   ignored), as captured from `cargo bench` or `cargo xtask bench`.
 ///
 /// A failed benchmark (`{"id": ..., "error": ...}`) is a record with every
-/// number `None`. When an id appears more than once, the last record wins
-/// in [`regressions`]. Provided infrastructure; O(input).
+/// number `None`. Duplicate ids are kept: [`regressions`] compares every
+/// successful record of an id in `old` against the *last* successful record
+/// of that id in `new`. Provided infrastructure; O(input).
 pub fn parse_benches(text: &str) -> Result<Vec<BenchRecord>, ReportError> {
     let trimmed = text.trim_start();
     let values = if trimmed.starts_with('{') || trimmed.starts_with('[') {

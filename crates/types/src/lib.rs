@@ -11,8 +11,11 @@
 
 use std::fmt;
 
-/// Price in integer ticks (tick size is per instrument). Signed so spreads
-/// and price differences are representable.
+/// Price in integer price units, the smallest representable increment
+/// (e.g. 1 unit = $0.01). An instrument's tradable increment is
+/// [`InstrumentSpec::tick`], a whole number of these units; the engine
+/// rejects prices that are not a multiple of it. Signed so spreads and
+/// price differences are representable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct Price(pub i64);
 

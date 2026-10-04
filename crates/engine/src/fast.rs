@@ -362,7 +362,8 @@ impl<B: OrderBook, R: RiskPolicy, const TAPE: usize> FastEngine<B, R, TAPE> {
             if limit.is_some_and(|l| !side.crosses(l, level.price)) {
                 return false;
             }
-            got += level.qty;
+            // Saturate: hostile quantities must not wrap the FOK check.
+            got = Qty(got.0.saturating_add(level.qty.0));
             got < want
         });
         got.min(want)

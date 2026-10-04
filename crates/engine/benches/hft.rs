@@ -467,6 +467,15 @@ fn w36_sharded_throughput() -> Report {
 /// dispatch, inlined) and `DynGuarded` (boxed book, boxed policy), as a
 /// throughput ratio: the median of 5 alternating measurements, so a change
 /// in machine load hits both sides alike.
+/// Built out of line so the compiler cannot see the concrete types behind
+/// the `dyn` and devirtualize the calls being measured.
+#[inline(never)]
+fn dyn_guarded<const CAP: u64>(spec: InstrumentSpec) -> DynGuarded {
+    let book: Box<dyn OrderBook> = Box::new(Book::with_capacity(1_024, 256));
+    let risk: Box<dyn RiskPolicy> = Box::new(MaxOrderQty::<CAP>);
+    Guarded::new(Engine::with_book(EngineConfig::new(spec), book), risk)
+}
+
 fn w37_static_vs_dyn() -> Report {
     const CAP: u64 = 1_000_000;
     let (setup, cmds) = mixed_flow_commands(1_000_000, 0x3737);
@@ -488,11 +497,7 @@ fn w37_static_vs_dyn() -> Report {
             "",
             &setup,
             &cmds,
-            || -> DynGuarded {
-                let book: Box<dyn OrderBook> = Box::new(Book::with_capacity(1_024, 256));
-                let risk: Box<dyn RiskPolicy> = Box::new(MaxOrderQty::<CAP>);
-                Guarded::new(Engine::with_book(EngineConfig::new(spec), book), risk)
-            },
+            || dyn_guarded::<CAP>(spec),
             |e, cmd, out| e.process(cmd, out),
         )
         .value
@@ -517,7 +522,9 @@ fn w38_match_latency() -> Report {
     latency_of(
         "w38.match_latency",
         "Submit→events after hot/cold split",
-        0x3838,
+        // Same stream as w07.match_latency, so before/after compare
+        // identical input.
+        0x0707,
         engine,
         |e, cmd, out| e.process(cmd, out),
     )

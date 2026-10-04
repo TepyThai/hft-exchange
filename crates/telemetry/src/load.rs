@@ -85,8 +85,13 @@ impl TimeSource for SimTime {
 /// took.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OpenLoop {
-    /// Gap between intended request starts (1e9 / rate).
+    /// Gap between intended request starts, rounded down to whole
+    /// nanoseconds (for display; the schedule itself uses `per_sec`).
     pub interval_ns: u64,
+    /// Offered rate in requests per second. Request `i` is due at
+    /// `i × 1e9 / per_sec` exactly: multiplying a rounded interval would
+    /// drift the offered rate above the one asked for.
+    pub per_sec: u64,
     /// Requests measured.
     pub requests: u64,
     /// Requests issued (on schedule) before measuring starts.
@@ -107,6 +112,7 @@ impl OpenLoop {
         );
         OpenLoop {
             interval_ns: 1_000_000_000 / per_sec,
+            per_sec,
             requests,
             warmup: 0,
         }
@@ -120,7 +126,7 @@ impl OpenLoop {
     /// Intended start of request `i` (counting warmup) for a run that began
     /// at `start`.
     pub fn intended_start(&self, start: u64, i: u64) -> u64 {
-        start + i * self.interval_ns
+        start + (i as u128 * 1_000_000_000 / self.per_sec as u128) as u64
     }
 
     /// Runs the schedule on one thread: for each request, wait until its
@@ -147,6 +153,7 @@ impl OpenLoop {
             elapsed_ns: 0,
             max_lag_ns: 0,
             interval_ns: self.interval_ns,
+            per_sec: self.per_sec,
         };
         let total = self.warmup + self.requests;
         let start = time.now();
@@ -187,8 +194,10 @@ pub struct LoadReport {
     /// intended start). Near the service time when healthy; large values
     /// mean the system (or the generator) could not keep up.
     pub max_lag_ns: u64,
-    /// The schedule's interval.
+    /// The schedule's interval, rounded down to whole nanoseconds.
     pub interval_ns: u64,
+    /// The schedule's offered rate, requests per second.
+    pub per_sec: u64,
 }
 
 impl LoadReport {
@@ -203,11 +212,7 @@ impl LoadReport {
 
     /// Requests per second the schedule asked for.
     pub fn offered_rate(&self) -> f64 {
-        if self.interval_ns == 0 {
-            0.0
-        } else {
-            1e9 / self.interval_ns as f64
-        }
+        self.per_sec as f64
     }
 }
 

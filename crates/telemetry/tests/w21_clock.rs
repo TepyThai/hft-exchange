@@ -57,7 +57,8 @@ fn w21_calibrated_clock_agrees_with_instant() {
     let by_clock = (c1 - c0) as f64;
     let by_instant = i1.duration_since(i0).as_nanos() as f64;
     let err = (by_clock - by_instant).abs() / by_instant;
-    // Calibration is good to ~1e-5; allow 1%.
+    // Calibration is good to a few parts in 1e8 (see the Clock docs);
+    // allow 1% so a loaded CI machine never flakes.
     assert!(
         err < 0.01,
         "clock measured {by_clock} ns, Instant {by_instant} ns (error {err:.5})"

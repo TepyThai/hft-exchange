@@ -379,7 +379,8 @@ impl<B: OrderBook> Engine<B> {
                     return false;
                 }
             }
-            got += level.qty;
+            // Saturate: hostile quantities must not wrap the FOK check.
+            got = Qty(got.0.saturating_add(level.qty.0));
             got < want
         });
         got.min(want)

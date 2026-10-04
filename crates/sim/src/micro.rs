@@ -326,6 +326,12 @@ impl MarkoutStats {
 /// later time arrives (or at [`finish`](Markouts::finish)), so results
 /// trail the clock by one update.
 ///
+/// Horizon 0 uses the mid in effect *at* the fill time, so if you record
+/// the post-trade mid at the same `t` as the fill (as the tests do), the
+/// horizon-0 markout already includes the fill's own price impact. Record
+/// the mid before the fill, or use a small positive horizon, for the
+/// pre-trade reference.
+///
 /// O(horizons) memory per fill still pending; each fill is resolved once
 /// per horizon, in O(1).
 // @student w41

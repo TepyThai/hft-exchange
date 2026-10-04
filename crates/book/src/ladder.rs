@@ -442,7 +442,7 @@ pub struct LadderBook {
     // * `sides`: one `Ladder` per side — `slots[price - base]` holds the
     //   level's arena index (`NIL` when empty), `bits` mirrors occupancy,
     //   `sparse` holds levels outside the window, `best` caches the best
-    //   level. Level data lives in the `levels` slab (not inline in the
+    //   level. Level data lives in the `levels` arena (not inline in the
     //   window) so that moving the window moves 4-byte indices, and nodes
     //   can keep a stable level link.
     // * `nodes` / `levels`: Vec arenas with free lists (as in `Book`); no

@@ -21,7 +21,7 @@
 //! per-shard event streams. There is no global order across shards — that
 //! is the point: instruments never wait for each other.
 //!
-//! **Where the w30 SPSC ring slots in.** The router → shard links are
+//! **Where the SPSC ring (weeks 1 and 5) slots in.** The router → shard links are
 //! single-producer single-consumer, and so is each shard → router path if
 //! it gets its own queue: replacing `std::sync::mpsc` with the `sync`
 //! crate's SPSC ring (busy-polled, no syscalls, no allocation per message)
