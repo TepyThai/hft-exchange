@@ -151,7 +151,7 @@ pub fn internet_checksum(bytes: &[u8]) -> u16 {
 /// write (send 0xFFFF in place of 0, which means "no checksum"); over a
 /// received segment with its checksum in place it is 0 when intact.
 /// O(len), no allocation.
-pub fn udp_checksum(src: Ipv4Addr, dst: Ipv4Addr, udp: &[u8]) -> u16 {
+pub fn udp_checksum(src: std::net::Ipv4Addr, dst: std::net::Ipv4Addr, udp: &[u8]) -> u16 {
     let mut sum = 0u32;
     for w in src
         .octets()
