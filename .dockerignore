@@ -1,0 +1,6 @@
+target
+.git
+apps
+hft-report.json
+rust-toolchain.toml
+**/*.swp

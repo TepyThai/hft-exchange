@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>hft-exchange demo</title>
+<style>
+  :root {
+    --bg: #f7f7f5; --panel: #ffffff; --ink: #1b1d21; --muted: #6b7079; --line: #e3e3df;
+    --bid: #0f8a5f; --bid-bg: rgba(15, 138, 95, .14); --ask: #c2412d; --ask-bg: rgba(194, 65, 45, .14);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #111316; --panel: #181b20; --ink: #e8e9ec; --muted: #8b919c; --line: #2a2e35;
+      --bid: #3ccf91; --bid-bg: rgba(60, 207, 145, .16); --ask: #ff7a63; --ask-bg: rgba(255, 122, 99, .16);
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.4 ui-sans-serif, system-ui, sans-serif; }
+  main { max-width: 960px; margin: 0 auto; padding: 16px; }
+  header { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
+  h1 { font-size: 18px; margin: 0; }
+  .pill { font-size: 12px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); }
+  .pill.live { color: var(--bid); border-color: var(--bid); }
+  .pill.down { color: var(--ask); border-color: var(--ask); }
+  .grid { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: 12px; }
+  @media (max-width: 640px) { .grid { grid-template-columns: minmax(0, 1fr); } }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px; min-width: 0; }
+  h2 { font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0 0 8px; }
+  table { width: 100%; border-collapse: collapse; font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; font-variant-numeric: tabular-nums; }
+  td { padding: 1px 6px; text-align: right; white-space: nowrap; }
+  td:first-child { text-align: left; }
+  tr.ask td.px { color: var(--ask); }
+  tr.bid td.px { color: var(--bid); }
+  tr.ask td.bar { background: linear-gradient(to left, var(--ask-bg) var(--w), transparent var(--w)); }
+  tr.bid td.bar { background: linear-gradient(to left, var(--bid-bg) var(--w), transparent var(--w)); }
+  tr.spread td { color: var(--muted); text-align: center; border-block: 1px dashed var(--line); }
+  .buy { color: var(--bid); } .sell { color: var(--ask); }
+  dl { display: grid; grid-template-columns: auto 1fr; gap: 2px 12px; margin: 0 0 12px; font-variant-numeric: tabular-nums; }
+  dt { color: var(--muted); } dd { margin: 0; text-align: right; font-family: ui-monospace, Menlo, monospace; }
+  footer { margin-top: 12px; color: var(--muted); font-size: 12px; }
+  a { color: inherit; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>hft-exchange demo</h1>
+    <span id="status" class="pill">connecting</span>
+    <span class="pill">feed seq <span id="seq">–</span></span>
+  </header>
+  <div class="grid">
+    <section>
+      <h2>Order book (L2)</h2>
+      <table><tbody id="ladder"></tbody></table>
+    </section>
+    <section>
+      <h2>Exchange</h2>
+      <dl>
+        <dt>commands</dt><dd id="commands">–</dd>
+        <dt>commands/s</dt><dd id="cps">–</dd>
+        <dt>trades</dt><dd id="trades">–</dd>
+        <dt>feed msgs/s here</dt><dd id="mps">–</dd>
+        <dt>feed clients</dt><dd id="clients">–</dd>
+      </dl>
+      <h2>Last trades</h2>
+      <table><tbody id="tape"></tbody></table>
+    </section>
+  </div>
+  <footer>
+    Simulated order flow through the matching engine, streamed as L2 snapshots and conflated updates over a WebSocket.
+    Demo numbers on a shared machine, not a latency benchmark.
+    <a href="/health">health</a> · <a href="/stats">stats</a> · <a href="/metrics">metrics</a>
+  </footer>
+</main>
+<script>
+"use strict";
+const CFG = __DEMO_CONFIG__;
+const DEPTH = 12;
+const px = (p) => (p / 100).toFixed(2);   // prices are integer ticks of 0.01
+const $ = (id) => document.getElementById(id);
+const book = { bids: new Map(), asks: new Map(), seq: 0 };
+let dirty = false, msgs = 0, retry = 500;
+
+function feedUrl() {
+  const q = new URLSearchParams(location.search).get("ws");
+  if (q) return q;
+  if (CFG.wsUrl) return CFG.wsUrl;
+  const scheme = location.protocol === "https:" ? "wss" : "ws";
+  return `${scheme}://${location.hostname || "localhost"}:${CFG.wsPort}/`;
+}
+
+function apply(msg) {
+  if (msg.type === "snapshot") {
+    book.bids = new Map(msg.bids);
+    book.asks = new Map(msg.asks);
+  } else if (msg.type === "updates") {
+    for (const u of msg.updates) {
+      const side = u.side === "buy" ? book.bids : book.asks;
+      if (u.qty === 0) side.delete(u.price); else side.set(u.price, u.qty);
+    }
+  }
+  book.seq = msg.seq;
+  dirty = true;
+}
+
+function connect() {
+  const ws = new WebSocket(feedUrl());
+  ws.onopen = () => { $("status").textContent = "live"; $("status").className = "pill live"; retry = 500; };
+  ws.onmessage = (e) => { msgs++; apply(JSON.parse(e.data)); };
+  ws.onclose = () => {
+    $("status").textContent = "reconnecting"; $("status").className = "pill down";
+    setTimeout(connect, retry); retry = Math.min(retry * 2, 8000);
+  };
+}
+
+function row(cls, price, qty, max) {
+  const w = max ? Math.round(100 * qty / max) : 0;
+  return `<tr class="${cls}"><td class="px">${px(price)}</td><td class="bar" style="--w:${w}%">${qty}</td></tr>`;
+}
+
+// Coalesce feed messages to the display's frame rate.
+function render() {
+  if (dirty) {
+    dirty = false;
+    const asks = [...book.asks].sort((a, b) => a[0] - b[0]).slice(0, DEPTH).reverse();
+    const bids = [...book.bids].sort((a, b) => b[0] - a[0]).slice(0, DEPTH);
+    const max = Math.max(1, ...asks.map((l) => l[1]), ...bids.map((l) => l[1]));
+    const spread = asks.length && bids.length ? px(asks[asks.length - 1][0] - bids[0][0]) : "–";
+    $("ladder").innerHTML = asks.map((l) => row("ask", l[0], l[1], max)).join("")
+      + `<tr class="spread"><td colspan="2">spread ${spread}</td></tr>`
+      + bids.map((l) => row("bid", l[0], l[1], max)).join("");
+    $("seq").textContent = book.seq;
+  }
+  requestAnimationFrame(render);
+}
+
+async function poll() {
+  try {
+    const s = await (await fetch("/stats", { cache: "no-store" })).json();
+    $("commands").textContent = s.commands.toLocaleString();
+    $("cps").textContent = Math.round(s.commands_per_sec).toLocaleString();
+    $("trades").textContent = s.trades.toLocaleString();
+    $("clients").textContent = s.ws_clients;
+    $("tape").innerHTML = s.last_trades.slice(0, 16).map(([n, p, q, side]) =>
+      `<tr><td class="${side}">${side}</td><td>${px(p)}</td><td>${q}</td></tr>`).join("");
+  } catch (_) { /* the status pill shows the feed; stats retry next tick */ }
+}
+
+setInterval(() => { $("mps").textContent = msgs * 2; msgs = 0; }, 500);
+setInterval(poll, 500);
+poll();
+connect();
+requestAnimationFrame(render);
+</script>
+</body>
+</html>

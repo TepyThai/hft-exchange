@@ -27,6 +27,48 @@ networking), and finally strategies, backtesting and a live demo.
 | `benchkit`, `xtask` | Measurement harness and tooling (provided) |
 | `apps/terminal` | A native trading terminal over your engine (GPUI) |
 
+## Architecture
+
+An order enters through a gateway session, passes pre-trade risk, is
+sequenced into the journal, matched by the single-threaded engine, and comes
+out as execution reports to its session and as L2 market data to everyone.
+Arrows that cross threads are queues; the boxes inside the engine thread
+call each other directly. [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
+has a paragraph per crate, the thread model and the invariants.
+
+```mermaid
+flowchart LR
+    subgraph exchange["exchange process"]
+        gateway["gateway<br/>sessions, decode, throttle"]
+        subgraph engine_thread["engine thread"]
+            risk["risk<br/>pre-trade checks"] -->|call| journal["journal<br/>sequence, append, replicate"]
+            journal -->|call| engine["engine<br/>price-time matching"]
+            engine -->|"events: call"| marketdata["marketdata<br/>L2 publisher"]
+        end
+    end
+    members(["members: FIX and binary clients"]) -->|"TCP (wire, fix)"| gateway
+    gateway -->|"orders: MPSC ring (sync)"| risk
+    engine -->|"execution reports: SPSC ring (sync)"| gateway
+    marketdata -->|"broadcast ring, then WebSocket"| viewers(["market-data clients"])
+    journal -.->|"replication (TCP)"| standby(["hot standby"])
+    book["book<br/>limit order book"] --- engine
+    wire["wire<br/>binary protocol"] --- gateway
+    fix["fix<br/>FIX 4.4"] --- gateway
+    sim["sim<br/>flow, strategies, backtests"] -->|"LiveSession: flow + engine"| demo["demo<br/>deployable exchange"]
+    sim --> wasm["wasm<br/>engine in the browser"]
+    sim --> terminal["apps/terminal<br/>GPUI terminal"]
+    demo -->|"L2 feed (marketdata) over WebSocket"| viewers
+    subgraph foundation["used by every crate"]
+        types["types<br/>orders, commands, events"]
+        sync["sync<br/>rings, queues, cancellation"]
+        telemetry["telemetry<br/>histograms, metrics, clocks"]
+    end
+    subgraph tooling["tooling"]
+        benchkit
+        xtask
+    end
+```
+
 ## How it works
 
 Each week of the [curriculum](https://tepy.dev/hft) has a guide on the site
@@ -67,6 +109,24 @@ Once weeks 6–8 pass, your engine can drive two front ends. Both run it with si
 
 ![hft-terminal](apps/terminal/screenshot.png)
 
+## Run the demo exchange
+
+Week 47 packages the engine, simulated order flow and the WebSocket market-data
+feed as one binary, `crates/demo`:
+
+```sh
+cargo run --release -p demo                     # http://localhost:8080 (page, /health, /metrics, /stats)
+cargo run --release -p demo -- --rate 20000 --seed 7 --duration 60s
+docker build -f Dockerfile.demo -t hft-demo . && docker run --rm --init -p 8080:8080 -p 8081:8081 hft-demo
+```
+
+The page at `/` connects to the feed on port 8081 and draws the ladder and the
+tape. Every flag has an `HFT_DEMO_*` environment variable (`HFT_DEMO_RATE`,
+`HFT_DEMO_SEED`, `HFT_DEMO_HTTP_ADDR`, `HFT_DEMO_WS_ADDR`, `HFT_DEMO_DURATION`,
+`HFT_DEMO_SHUTDOWN_TOKEN`, `HFT_DEMO_PUBLIC_WS_URL`, …); `demo --help` lists
+them all. [`fly.toml`](fly.toml) is an example deployment. The demo runs on
+whatever machine you give it, so its numbers are demo numbers, not benchmarks.
+
 ## Branches
 
 * `main` — the template you work in.
@@ -80,5 +140,13 @@ whether threads share cores. Run on an idle machine, plug in your laptop,
 and compare against your own previous runs before comparing with anyone
 else's. CI runners are noisy shared machines, so CI reports tests only by
 default.
+
+Publish numbers from data, not by hand. The report renders as a Markdown
+table with its machine, commit and sample counts:
+
+```sh
+cargo xtask report --markdown BENCHMARKS.md              # run tests + benchmarks, write both
+cargo xtask report --from hft-report.json --markdown -   # re-render a saved report to stdout
+```
 
 License: MIT.

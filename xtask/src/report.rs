@@ -352,7 +352,27 @@ pub fn build_report(args: &Args, tests: &TestRun, benches: &[BenchResult]) -> St
     )
 }
 
+/// Writes rendered Markdown to `path`, or to stdout for `-`.
+fn write_markdown(path: &str, report_json: &str) -> Result<(), String> {
+    let md = crate::markdown::render(report_json)?;
+    if path == "-" {
+        print!("{md}");
+    } else {
+        std::fs::write(path, &md).map_err(|e| format!("writing {path}: {e}"))?;
+        println!("markdown → {path}");
+    }
+    Ok(())
+}
+
 pub fn cmd_report(args: &Args) -> Result<bool, String> {
+    if let Some(from) = args.value("from") {
+        let Some(path) = args.value("markdown") else {
+            return Err("--from renders a saved report: add --markdown PATH (or - for stdout)".into());
+        };
+        let json = std::fs::read_to_string(from).map_err(|e| format!("reading {from}: {e}"))?;
+        write_markdown(path, &json)?;
+        return Ok(true);
+    }
     let tests = run_tests(args.weeks)?;
     let benches = if args.flag("no-bench") { Vec::new() } else { run_benches(args.weeks, None) };
     let report = build_report(args, &tests, &benches);
@@ -367,6 +387,9 @@ pub fn cmd_report(args: &Args) -> Result<bool, String> {
         tests.weeks.len(),
         benches.len()
     );
+    if let Some(md) = args.value("markdown") {
+        write_markdown(md, &report)?;
+    }
 
     if args.flag("upload") {
         let token = args
