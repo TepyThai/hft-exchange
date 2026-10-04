@@ -63,7 +63,7 @@ impl UserState {
     /// Open orders, newest first.
     pub fn open_orders(&self) -> Vec<UserOrder> {
         let mut v: Vec<UserOrder> = self.open.values().copied().collect();
-        v.sort_by(|a, b| b.id.cmp(&a.id));
+        v.sort_by_key(|o| std::cmp::Reverse(o.id));
         v
     }
 
