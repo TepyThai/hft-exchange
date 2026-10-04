@@ -9,7 +9,7 @@
 # SIGTERM reaches the demo; it holds no journal, so exiting on SIGTERM is a
 # clean stop. Configure it with HFT_DEMO_* variables (`demo --help`).
 
-FROM rust:1-slim-bookworm AS build
+FROM rust:1.97.1-slim-bookworm AS build
 WORKDIR /src
 # The workspace has no external dependencies, so there is no dependency
 # layer worth caching separately. .dockerignore leaves out target/, .git,
