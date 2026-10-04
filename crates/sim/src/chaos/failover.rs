@@ -64,12 +64,11 @@ pub struct FailoverConfig {
     /// The primary also sends a heartbeat every this many steps while busy
     /// (it always does when idle). 0 = only when idle.
     ///
-    /// Under load the frames themselves keep the lease alive, but only a
-    /// heartbeat makes the week 20 standby repeat a resend request: it asks
-    /// once per missing sequence number, so if that request is lost and
-    /// the primary never goes idle, replication — and with it every
-    /// acknowledgement — stalls until it does. Heartbeating while busy
-    /// bounds the stall.
+    /// Under load the frames themselves keep the lease alive. A lost
+    /// resend request is repeated by the standby after a quarter of the
+    /// lease (this harness found the stall that caused before that fix);
+    /// heartbeating while busy still exposes a lost *last* frame sooner
+    /// and bounds acknowledgement lag further.
     pub heartbeat_every: u64,
     /// Liveness bound: the run must finish within this many steps.
     pub max_steps: u64,

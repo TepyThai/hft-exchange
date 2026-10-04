@@ -12,16 +12,22 @@ and speak FIX 4.4 or the binary protocol. Their orders flow along one line:
 
 **gateway → risk → journal → engine → market data**
 
-1. A **gateway** I/O thread decodes a frame into a `Command`, checks the
-   session's throttle and pushes the command onto an MPSC ring.
-2. The **engine thread** pops it. Pre-trade **risk** checks it against the
-   account's limits; the **journal** gives it the next sequence number and
-   appends it (and, with a standby, replicates it); the **engine** matches
-   it and emits `Event`s; the **L2 publisher** turns events into price-level
-   updates. All four are direct calls on that one thread.
-3. Events go back to the owning session as execution reports over an SPSC
-   ring, and L2 updates go to every market-data client through a broadcast
-   ring that never waits for a reader.
+1. A **gateway** I/O task (Tokio) decodes a binary-protocol frame into a
+   `Command`, remaps the client's order id, and pushes the command onto the
+   `sync` MPSC ring to the engine thread — or answers *busy* at once when
+   that bounded ring is full.
+2. The **engine thread** pops it. Pre-trade **risk** (limits and the
+   session/account throttles, `risk::RiskGate`) checks it; the **journal**
+   gives it the next sequence number and appends it (write-ahead, one file
+   per instrument); the **engine** matches it and emits `Event`s; the **L2
+   publisher** turns events into price-level updates. All four are direct
+   calls on that one thread.
+3. At the end of each batch the journal is committed (group fsync, per the
+   configured policy). Only then do the batch's execution reports go back
+   to the owning sessions over per-session channels, and its L2 updates and
+   trades go to every market-data client through broadcast rings that never
+   wait for a reader. A slow session is disconnected rather than allowed to
+   block the engine.
 
 The **demo** runs the same engine and market data with simulated members
 instead of a gateway, and serves the feed over WebSocket. **wasm** and
@@ -32,14 +38,19 @@ tab and in a native window.
 
 | Thread | Owns | In | Out |
 | --- | --- | --- | --- |
-| gateway I/O (Tokio) | sessions, FIX/binary codecs, throttles | TCP | commands: MPSC ring |
-| engine | risk state, journal writer, order book, L2 publisher | MPSC ring | execution reports: SPSC ring; L2 updates: broadcast ring |
-| market-data clients | one ring cursor and conflation buffer each | broadcast ring | WebSocket / UDP |
-| replication | the standby connection | journal | TCP |
+| gateway I/O (Tokio) | sessions, binary codec, order-id remapping, busy rejects | TCP | commands: MPSC ring (`sync`) |
+| engine | risk state and throttles, journal writer, order book, L2 publisher | MPSC ring | execution reports: per-session channels (Tokio), after each journal commit; L2 updates and trades: broadcast rings |
+| market-data clients | one ring cursor and conflation buffer each | broadcast ring | WebSocket |
 
-Every arrow that crosses a thread is a queue from `sync` or `marketdata`,
-and every queue is bounded. Nothing on the engine thread takes a lock or
-waits on a consumer.
+FIX (`crates/fix`) is a standalone, sans-IO library: the gateway speaks
+only the binary protocol. Replication (`journal::Primary`/`Standby`, week
+20) is built and tested on its own; exchange v2 does not replicate yet.
+
+Every arrow that crosses a thread is a bounded queue: the `sync` MPSC
+ring in, `marketdata` broadcast rings out, and bounded Tokio channels for
+execution reports (a full one disconnects that session). Nothing on the
+engine thread takes a lock or waits on a consumer; the journal commit is
+the one place it waits, by design (an ack must not outrun durability).
 
 ## Invariants
 

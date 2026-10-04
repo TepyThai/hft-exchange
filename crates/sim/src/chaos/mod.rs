@@ -57,7 +57,7 @@
 //!     .map(|seed| schedule.reseeded(seed))
 //!     .find(|p| fails(p))
 //!     .expect("a seed that breaks the SLO");
-//! let report = failing.to_string(); // "seed=2 drop(to-standby,50)@0..2000 … crash@222"
+//! let report = failing.to_string(); // e.g. "seed=… drop(to-standby,50)@0..2000 … crash@222"
 //!
 //! // 2. Replay it from the report: the same run, every time.
 //! let replayed: FaultPlan = report.parse().unwrap();
@@ -66,7 +66,7 @@
 //! // 3. Shrink it: fewer faults, narrower windows, lower rates.
 //! let minimal = shrink_plan(&replayed, fails);
 //! println!("minimal failing plan: {minimal}");
-//! // e.g. "seed=2 delay(to-standby,57,4)@148..220 crash@222": a frame the
+//! // e.g. "seed=1 delay(to-standby,48,4)@86..221 crash@222": a frame the
 //! // primary sent just before dying arrives late; the standby takes it as
 //! // a sign of life and renews its promise not to take over.
 //! ```

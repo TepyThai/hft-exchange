@@ -39,18 +39,18 @@ has a paragraph per crate, the thread model and the invariants.
 ```mermaid
 flowchart LR
     subgraph exchange["exchange process"]
-        gateway["gateway<br/>sessions, decode, throttle"]
+        gateway["gateway<br/>sessions, decode, busy rejects"]
         subgraph engine_thread["engine thread"]
-            risk["risk<br/>pre-trade checks"] -->|call| journal["journal<br/>sequence, append, replicate"]
+            risk["risk<br/>pre-trade checks, throttles"] -->|call| journal["journal<br/>sequence, append, replicate"]
             journal -->|call| engine["engine<br/>price-time matching"]
             engine -->|"events: call"| marketdata["marketdata<br/>L2 publisher"]
         end
     end
     members(["members: FIX and binary clients"]) -->|"TCP (wire, fix)"| gateway
     gateway -->|"orders: MPSC ring (sync)"| risk
-    engine -->|"execution reports: SPSC ring (sync)"| gateway
+    engine -->|"execution reports, after the journal commit: per-session channels"| gateway
     marketdata -->|"broadcast ring, then WebSocket"| viewers(["market-data clients"])
-    journal -.->|"replication (TCP)"| standby(["hot standby"])
+    journal -.->|"replication (week 20)"| standby(["hot standby"])
     book["book<br/>limit order book"] --- engine
     wire["wire<br/>binary protocol"] --- gateway
     fix["fix<br/>FIX 4.4"] --- gateway

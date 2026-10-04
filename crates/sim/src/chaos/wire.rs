@@ -11,8 +11,11 @@
 //! from its NIC (the Ethernet frame check sequence, the UDP checksum): a
 //! datagram damaged in transit fails [`open`] and must be treated as
 //! **lost**, never half-applied. The week 46 feed layout has no checksum of
-//! its own, and its decoder only validates structure — a flipped bit in a
-//! price or a quantity decodes fine.
+//! its own and its decoder only validates structure, so a flipped bit in a
+//! price decodes fine; real captures are protected by the UDP checksum,
+//! which `marketdata::pcap::parse_udp` verifies (added after this harness
+//! showed a corrupted price being applied). These in-memory datagrams have
+//! no UDP header, hence the trailer.
 //!
 //! A heartbeat is what a quiet line sends (as MoldUDP64 does): the
 //! publisher's next sequence number, so a receiver that lost the last
