@@ -36,7 +36,7 @@ pub fn cmd_strip(args: &Args) -> Result<bool, String> {
         let src = std::fs::read_to_string(&file).map_err(|e| e.to_string())?;
         let (next, n) = strip_source(&src).map_err(|e| format!("{}: {e}", file.display()))?;
         if n > 0 {
-            std::fs::write(&file, next).map_err(|e| e.to_string())?;
+            std::fs::write(&file, allow_hint_imports(&next)).map_err(|e| e.to_string())?;
             stripped += n;
         }
     }
@@ -319,6 +319,27 @@ fn indent_of(line: &str) -> String {
     line.chars().take_while(|c| c.is_whitespace()).collect()
 }
 
+/// Stubbed modules keep the reference's `use` lines as hints for what the
+/// learner will need; allow them (and `mut` bindings on stub parameters)
+/// so the template builds without warnings. Inserted after the module's
+/// leading `//!` docs and inner attributes.
+fn allow_hint_imports(src: &str) -> String {
+    let mut at = 0;
+    for line in src.split_inclusive('\n') {
+        let t = line.trim_start();
+        if t.starts_with("//!") || t.starts_with("#![") || t.trim().is_empty() {
+            at += line.len();
+        } else {
+            break;
+        }
+    }
+    let mut out = String::with_capacity(src.len() + 96);
+    out.push_str(&src[..at]);
+    out.push_str("#![allow(unused_imports, unused_mut, dead_code)] // template: imports and helpers are hints for what you'll need\n");
+    out.push_str(&src[at..]);
+    out
+}
+
 /// Returns the stripped source and how many items were stripped.
 pub fn strip_source(src: &str) -> Result<(String, usize), String> {
     let mut out = src.to_string();
@@ -343,7 +364,16 @@ pub fn strip_source(src: &str) -> Result<(String, usize), String> {
         loop {
             let line_end = out[pos..].find('\n').map_or(out.len(), |p| pos + p);
             let line = out[pos..line_end].trim();
-            if line.is_empty() || line.starts_with("#[") || line.starts_with("///") || (line.starts_with("//") && !line.starts_with("// @student")) {
+            if line.starts_with("#[") {
+                // Attributes may span lines (`#[cfg_attr(\n ... \n)]`): skip to
+                // the line holding the matching `]`.
+                let start = pos + out[pos..].find("#[").unwrap_or(0);
+                let end = attribute_end(out.as_bytes(), start).ok_or_else(|| format!("marker {week}: unterminated attribute"))?;
+                let after = out[end..].find('\n').map_or(out.len(), |p| end + p);
+                pos = (after + 1).min(out.len());
+                continue;
+            }
+            if line.is_empty() || line.starts_with("///") || (line.starts_with("//") && !line.starts_with("// @student")) {
                 pos = (line_end + 1).min(out.len());
                 if pos >= out.len() {
                     return Err(format!("marker {week} not followed by an item"));
@@ -356,15 +386,20 @@ pub fn strip_source(src: &str) -> Result<(String, usize), String> {
         let header = out[pos..open].to_string();
         let close = match_brace(out.as_bytes(), open)?;
         let item_indent = indent_of(&out[out[..pos].rfind('\n').map_or(0, |p| p + 1)..pos + 1]);
+        // Stubs ignore their parameters; keep the learner's build output
+        // free of warnings that aren't theirs.
+        let allow = format!("{item_indent}#[allow(unused_variables)]\n");
         match item_kind(&header) {
             ItemKind::Fn(name) => {
                 let body = format!("{{\n{item_indent}    todo!(\"{week}: {name}\")\n{item_indent}}}");
                 out.replace_range(open..=close, &body);
+                out.insert_str(pos, &allow);
             }
             ItemKind::Impl => {
                 let inner = out[open + 1..close].to_string();
                 let stripped = strip_impl_bodies(&inner, &week)?;
                 out.replace_range(open + 1..close, &stripped);
+                out.insert_str(pos, &allow);
             }
             ItemKind::Struct { generics } => {
                 let phantom = phantom_for(&generics);
@@ -381,6 +416,38 @@ pub fn strip_source(src: &str) -> Result<(String, usize), String> {
         count += 1;
     }
     Ok((out, count))
+}
+
+/// Index just past the `]` closing the attribute that starts at `start`
+/// (`#[`), skipping brackets inside string literals.
+fn attribute_end(b: &[u8], start: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut i = start + 1;
+    let mut in_str = false;
+    while i < b.len() {
+        let c = b[i];
+        if in_str {
+            if c == b'\\' {
+                i += 1;
+            } else if c == b'"' {
+                in_str = false;
+            }
+        } else {
+            match c {
+                b'"' => in_str = true,
+                b'[' => depth += 1,
+                b']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(i + 1);
+                    }
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Replace every fn body inside an impl block.
