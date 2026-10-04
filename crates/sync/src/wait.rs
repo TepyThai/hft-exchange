@@ -1,0 +1,260 @@
+//! Week 30: how a consumer thread waits for work.
+//!
+//! An idle consumer (the engine waiting on its inbound queue) can
+//!
+//! * **busy-spin** ([`BusySpin`]): poll in a tight loop. Lowest wakeup
+//!   latency (one cache-line transfer, ~100 ns) at the price of a whole
+//!   core at 100% forever — the right call for a pinned engine thread on an
+//!   isolated core;
+//! * **spin, then yield** ([`SpinYield`]): poll for a while, then call
+//!   `yield_now` between polls. Still burns CPU, but lets other runnable
+//!   threads on the core make progress;
+//! * **spin, then park** ([`SpinPark`]): poll for a bounded time, then sleep
+//!   in the kernel until the producer calls [`WaitStrategy::notify`]. Costs
+//!   nothing while idle, but a wakeup goes through the scheduler (tens of
+//!   µs, worse from deep C-states).
+//!
+//! All three implement [`WaitStrategy`], so the consumer loop is written
+//! once and the strategy is a deployment decision measured by the w30
+//! benchmarks.
+//!
+//! # Protocol
+//!
+//! The waiter polls a condition; the producer makes it true and then calls
+//! `notify`:
+//!
+//! ```
+//! use std::sync::Arc;
+//! use std::time::Duration;
+//! use sync::{SpinPark, WaitStrategy};
+//!
+//! let (mut tx, mut rx) = sync::spsc::channel::<u64>(1024);
+//! let wait = Arc::new(SpinPark::new(1_000, Duration::from_millis(1)));
+//! let w = Arc::clone(&wait);
+//! let consumer = std::thread::spawn(move || {
+//!     w.wait_until(|| !rx.is_empty()); // spins, then parks
+//!     rx.try_pop()
+//! });
+//! tx.try_push(7).unwrap();
+//! wait.notify(); // after publishing: wakes the consumer if it parked
+//! assert_eq!(consumer.join().unwrap(), Some(7));
+//! ```
+//!
+//! [`SpinPark`] supports **one waiting thread at a time** (the consumer of
+//! an SPSC/MPSC queue); any number of threads may call `notify`.
+
+use std::sync::atomic::{fence, AtomicBool, Ordering};
+use std::sync::Mutex;
+use std::thread::Thread;
+use std::time::{Duration, Instant};
+
+/// How a thread waits for a condition another thread will make true.
+pub trait WaitStrategy: Send + Sync {
+    /// Polls `ready` until it returns true (returns `true`) or `deadline`
+    /// passes (returns `false`; `None` waits forever). Returns immediately
+    /// if `ready()` is already true. `ready` must be cheap and must observe
+    /// the producer's writes with `Acquire` (an SPSC `is_empty`, an atomic
+    /// load) — it is called many times.
+    fn wait_for<F: FnMut() -> bool>(&self, ready: F, deadline: Option<Instant>) -> bool;
+
+    /// Called by a producer **after** making the condition true. Wakes the
+    /// waiter if it is sleeping; free for spinning strategies.
+    fn notify(&self);
+
+    /// Waits until `ready` returns true, with no deadline.
+    fn wait_until<F: FnMut() -> bool>(&self, ready: F) {
+        self.wait_for(ready, None);
+    }
+}
+
+/// How many polls between deadline checks (`Instant::now` costs ~20 ns).
+/// A power of two, so the check is a mask.
+const CLOCK_EVERY: u32 = 64;
+
+/// Polls in a tight loop with a CPU `pause` hint between polls. Lowest
+/// latency; burns a full core while waiting.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BusySpin;
+
+/// Spins for `spins` polls, then yields the CPU to the scheduler between
+/// polls. Burns CPU while waiting, but cooperates with other threads on
+/// the same core.
+#[derive(Clone, Copy, Debug)]
+pub struct SpinYield {
+    /// Polls before the first `yield_now`.
+    pub spins: u32,
+}
+
+impl SpinYield {
+    /// Spin `spins` polls before starting to yield.
+    pub fn new(spins: u32) -> SpinYield {
+        SpinYield { spins }
+    }
+}
+
+impl Default for SpinYield {
+    fn default() -> Self {
+        SpinYield::new(1_000)
+    }
+}
+
+// @student w30
+impl WaitStrategy for BusySpin {
+    #[inline]
+    fn wait_for<F: FnMut() -> bool>(&self, mut ready: F, deadline: Option<Instant>) -> bool {
+        let mut polls = 0u32;
+        loop {
+            if ready() {
+                return true;
+            }
+            std::hint::spin_loop();
+            polls = polls.wrapping_add(1);
+            if polls & (CLOCK_EVERY - 1) == 0 && deadline.is_some_and(|d| Instant::now() >= d) {
+                return ready();
+            }
+        }
+    }
+
+    #[inline]
+    fn notify(&self) {}
+}
+
+// @student w30
+impl WaitStrategy for SpinYield {
+    fn wait_for<F: FnMut() -> bool>(&self, mut ready: F, deadline: Option<Instant>) -> bool {
+        let mut polls = 0u32;
+        loop {
+            if ready() {
+                return true;
+            }
+            if polls < self.spins {
+                std::hint::spin_loop();
+            } else {
+                std::thread::yield_now();
+            }
+            polls = polls.saturating_add(1);
+            if (polls >= self.spins || polls & (CLOCK_EVERY - 1) == 0)
+                && deadline.is_some_and(|d| Instant::now() >= d)
+            {
+                return ready();
+            }
+        }
+    }
+
+    #[inline]
+    fn notify(&self) {}
+}
+
+/// Spins for `spins` polls, then parks the thread until [`notify`]
+/// (or at most `max_park`, after which it re-polls — so a waiter whose
+/// producer forgets to notify, or a cancellation flag nobody notifies for,
+/// is still observed within `max_park`).
+///
+/// `notify` costs one `SeqCst` fence (~10–30 ns) when nobody sleeps, plus
+/// an `unpark` (a futex wake syscall) when the waiter is parked.
+///
+/// [`notify`]: WaitStrategy::notify
+// @student w30
+pub struct SpinPark {
+    spins: u32,
+    max_park: Duration,
+    /// True while the waiter is (about to be) parked.
+    sleeping: AtomicBool,
+    /// The waiting thread, registered before it first parks.
+    waiter: Mutex<Option<Thread>>,
+}
+
+// @student w30
+impl SpinPark {
+    /// Spin `spins` polls, then park for at most `max_park` at a time.
+    pub fn new(spins: u32, max_park: Duration) -> SpinPark {
+        SpinPark {
+            spins,
+            max_park,
+            sleeping: AtomicBool::new(false),
+            waiter: Mutex::new(None),
+        }
+    }
+
+    /// True while the waiter is parked (or about to park). Diagnostic, used
+    /// by benchmarks to make sure they measure the parked path.
+    pub fn is_parked(&self) -> bool {
+        self.sleeping.load(Ordering::Relaxed)
+    }
+}
+
+impl Default for SpinPark {
+    /// 10k polls (a few µs) then park, re-polling at least every 1 ms.
+    fn default() -> Self {
+        SpinPark::new(10_000, Duration::from_millis(1))
+    }
+}
+
+// @student w30
+impl WaitStrategy for SpinPark {
+    fn wait_for<F: FnMut() -> bool>(&self, mut ready: F, deadline: Option<Instant>) -> bool {
+        for polls in 0..self.spins {
+            if ready() {
+                return true;
+            }
+            std::hint::spin_loop();
+            if polls & (CLOCK_EVERY - 1) == CLOCK_EVERY - 1
+                && deadline.is_some_and(|d| Instant::now() >= d)
+            {
+                return ready();
+            }
+        }
+        loop {
+            if ready() {
+                return true;
+            }
+            let park_for = match deadline {
+                Some(d) => {
+                    let left = d.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        return ready();
+                    }
+                    left.min(self.max_park)
+                }
+                None => self.max_park,
+            };
+            *self.waiter.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::thread::current());
+            self.sleeping.store(true, Ordering::Relaxed);
+            // Dekker-style handshake with `notify`: store(sleeping);
+            // fence; load(condition) here, store(condition); fence;
+            // load(sleeping) there. The SeqCst fences guarantee at least one
+            // side sees the other's store, so either we see the data and
+            // skip parking, or the producer sees `sleeping` and unparks us
+            // (an unpark before park makes park return at once).
+            fence(Ordering::SeqCst);
+            if ready() {
+                self.sleeping.store(false, Ordering::Relaxed);
+                return true;
+            }
+            std::thread::park_timeout(park_for);
+            self.sleeping.store(false, Ordering::Relaxed);
+        }
+    }
+
+    fn notify(&self) {
+        fence(Ordering::SeqCst);
+        if self.sleeping.load(Ordering::Relaxed) {
+            if let Some(thread) = self
+                .waiter
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+            {
+                thread.unpark();
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for SpinPark {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SpinPark")
+            .field("parked", &self.is_parked())
+            .finish()
+    }
+}
