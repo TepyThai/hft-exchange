@@ -1,0 +1,71 @@
+# Example Fly.io deployment of the demo exchange (week 47). Nothing deploys
+# this automatically. To use it: pick an app name, then
+#   fly launch --copy-config --no-deploy && fly deploy
+# The demo is a public, read-only market-data feed on a small shared VM:
+# its latency numbers are demo numbers, not benchmarks.
+
+app = "hft-demo-example"
+primary_region = "iad"
+# Fly's init forwards the signal; the demo exits at once (no journal to flush).
+kill_signal = "SIGTERM"
+kill_timeout = "10s"
+
+[build]
+  dockerfile = "Dockerfile.demo"
+
+[env]
+  HFT_DEMO_HTTP_ADDR = "0.0.0.0:8080"
+  HFT_DEMO_WS_ADDR = "0.0.0.0:8081"
+  HFT_DEMO_RATE = "2000"
+  HFT_DEMO_SEED = "42"
+  HFT_DEMO_MAX_WS_CLIENTS = "200"
+  # The page is served over https, so browsers must reach the feed with
+  # wss:// on the TLS port of the [[services]] block below.
+  HFT_DEMO_PUBLIC_WS_URL = "wss://hft-demo-example.fly.dev:8443/"
+
+# The page, /health, /stats and /metrics. In a real deployment keep
+# /metrics off the public interface (a private port or the scraper below).
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [http_service.concurrency]
+    type = "connections"
+    soft_limit = 100
+    hard_limit = 128
+
+  # 200 only once the feed is publishing; 503 while starting or stopping.
+  [[http_service.checks]]
+    grace_period = "5s"
+    interval = "10s"
+    method = "GET"
+    path = "/health"
+    timeout = "2s"
+
+# The WebSocket feed: Fly's proxy terminates TLS on 8443 and passes the raw
+# stream to the demo, which does the WebSocket handshake itself.
+[[services]]
+  internal_port = 8081
+  protocol = "tcp"
+  auto_stop_machines = "off"
+
+  [[services.ports]]
+    port = 8443
+    handlers = ["tls"]
+
+  [services.concurrency]
+    type = "connections"
+    soft_limit = 200
+    hard_limit = 256
+
+# Fly's managed Prometheus scrapes the demo's own metrics.
+[metrics]
+  port = 8080
+  path = "/metrics"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"

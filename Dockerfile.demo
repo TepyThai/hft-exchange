@@ -1,0 +1,31 @@
+# The demo exchange (week 47): engine + simulated flow + WebSocket L2 feed.
+#
+#   docker build -f Dockerfile.demo -t hft-demo .
+#   docker run --rm --init -p 8080:8080 -p 8081:8081 hft-demo
+#
+# Build once, promote the same image everywhere. The runtime image is
+# distroless (glibc, no shell, no package manager) and runs as a non-root
+# user. Run it under an init (`--init`, or the platform's own, as on Fly) so
+# SIGTERM reaches the demo; it holds no journal, so exiting on SIGTERM is a
+# clean stop. Configure it with HFT_DEMO_* variables (`demo --help`).
+
+FROM rust:1-slim-bookworm AS build
+WORKDIR /src
+# The workspace has no external dependencies, so there is no dependency
+# layer worth caching separately. .dockerignore leaves out target/, .git,
+# apps/ and the toolchain file (the image's stable toolchain builds it).
+# Works with BuildKit and the legacy builder alike.
+COPY . .
+RUN cargo build --release --locked -p demo \
+    && cp target/release/demo /usr/local/bin/demo
+
+FROM gcr.io/distroless/cc-debian12:nonroot
+COPY --from=build /usr/local/bin/demo /usr/local/bin/demo
+ENV HFT_DEMO_HTTP_ADDR=0.0.0.0:8080 \
+    HFT_DEMO_WS_ADDR=0.0.0.0:8081
+EXPOSE 8080 8081
+USER nonroot:nonroot
+# No curl in a distroless image: the binary probes its own /health.
+HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
+    CMD ["/usr/local/bin/demo", "healthcheck"]
+ENTRYPOINT ["/usr/local/bin/demo"]

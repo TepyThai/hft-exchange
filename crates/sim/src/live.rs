@@ -158,6 +158,15 @@ impl LiveSession {
         self.stats
     }
 
+    /// The events the engine emitted for the most recent command (from
+    /// [`step`](Self::step), [`submit`](Self::submit) or
+    /// [`cancel`](Self::cancel)), in order; empty before the first. This is
+    /// how a server feeds the session's output to market data (the demo's
+    /// `L2Publisher`). O(1), no allocation; overwritten by the next command.
+    pub fn last_events(&self) -> &[Event] {
+        &self.events
+    }
+
     /// Process one simulated command; returns the trades it caused.
     pub fn step(&mut self) -> u32 {
         let cmd = self.flow.next_command();
@@ -290,5 +299,20 @@ mod tests {
         let mut s = LiveSession::new(1);
         s.submit(Side::Buy, UserKind::Limit, 10_000, 0);
         assert_eq!(s.user().rejects().next().map(|r| r.1), Some(RejectReason::ZeroQuantity));
+    }
+
+    #[test]
+    fn last_events_are_the_latest_commands_events() {
+        let mut s = LiveSession::new(3);
+        assert!(s.last_events().is_empty());
+        let mut seen = 0u64;
+        for _ in 0..2_000 {
+            s.step();
+            assert!(!s.last_events().is_empty(), "every command emits at least one event");
+            seen += s.last_events().len() as u64;
+        }
+        assert_eq!(seen, s.stats().events);
+        s.submit(Side::Buy, UserKind::Limit, 10_000, 0);
+        assert!(matches!(s.last_events(), [Event::Rejected { reason: RejectReason::ZeroQuantity, .. }]));
     }
 }

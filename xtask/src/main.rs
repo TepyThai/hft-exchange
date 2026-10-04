@@ -4,6 +4,8 @@
 //! cargo xtask test   [--week N | --upto N]            week-scoped tests (names start with wNN_)
 //! cargo xtask bench  [--week N | --upto N] [FILTER]   benchmarks (ids start with wNN.)
 //! cargo xtask report [--upto N] [--no-bench] [--upload] [--token T] [--endpoint URL] [--source ci|local]
+//!                    [--json PATH] [--markdown PATH|-]
+//! cargo xtask report --from REPORT.json --markdown PATH|-   re-render a saved report, run nothing
 //! cargo xtask strip  --out DIR [--check]              generate the learner template from the reference
 //! cargo xtask wasm   [--out PATH]                      build the engine for the browser (tepy.dev/hft/live)
 //! ```
@@ -11,8 +13,12 @@
 //! Reports are JSON (schema 1) written to `hft-report.json`; `--upload`
 //! POSTs them to tepy.dev (token from `--token` or `TEPY_TOKEN`), where the
 //! week pages and the lab dashboard show your test status and benchmark
-//! history.
+//! history. `--markdown` also renders the report as a Markdown benchmark
+//! table (machine, commit, p50/p99/p99.9 or value per benchmark) for the
+//! README or docs; `--from` renders a saved report without running
+//! anything.
 
+mod markdown;
 mod report;
 mod strip;
 mod wasm;
@@ -63,7 +69,10 @@ impl Args {
         let mut i = 0;
         while i < raw.len() {
             let a = &raw[i];
-            let takes_value = matches!(a.as_str(), "--week" | "--upto" | "--token" | "--endpoint" | "--source" | "--out" | "--json");
+            let takes_value = matches!(
+                a.as_str(),
+                "--week" | "--upto" | "--token" | "--endpoint" | "--source" | "--out" | "--json" | "--markdown" | "--from"
+            );
             if takes_value {
                 let v = raw.get(i + 1).ok_or_else(|| format!("{a} needs a value"))?.clone();
                 match a.as_str() {
@@ -106,7 +115,9 @@ const USAGE: &str = "usage: cargo xtask <test|bench|report|strip|wasm> [--week N
   test    run week-scoped tests (names start with wNN_)
   bench   run benchmarks (ids start with wNN.) — optional substring FILTER
   report  tests + benchmarks → hft-report.json; --upload sends it to tepy.dev
-          (--token or TEPY_TOKEN, --endpoint, --source ci|local, --no-bench)
+          (--token or TEPY_TOKEN, --endpoint, --source ci|local, --no-bench);
+          --markdown PATH (or - for stdout) also writes a Markdown benchmark table;
+          --from REPORT.json --markdown PATH renders a saved report, running nothing
   strip   --out DIR [--check]: generate the learner template (bodies of
           `// @student wNN` items become todo!()); --check also builds it
   wasm    [--out PATH]: build crates/wasm for the browser → target/wasm/hft-engine.wasm";
