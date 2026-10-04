@@ -5,10 +5,16 @@
 //! (the w12 generator is not needed).
 
 use benchkit::{black_box, Report, Unit};
+use engine::perf::fastest_engine;
 use engine::testkit::{FlowConfig, OrderFlow};
-use engine::{Engine, OrderBook};
+use engine::{
+    Book, DynGuarded, Engine, EngineConfig, FastEngine, Guarded, InstrumentRegistry, MaxOrderQty,
+    NoRisk, OrderBook, RiskPolicy, ShardedEngine,
+};
 use std::collections::HashMap;
-use types::{Command, Event, InstrumentSpec, NewOrder, OrderId, Price, Rng, Side, TimeInForce};
+use types::{
+    Command, Event, InstrumentId, InstrumentSpec, NewOrder, OrderId, Price, Rng, Side, TimeInForce,
+};
 
 const MID: i64 = 100_000;
 
@@ -72,6 +78,20 @@ fn depth_ticks(rng: &mut Rng, max: u64) -> i64 {
 /// a shadow engine, so replaying it on a clone of the returned engine hits
 /// live orders exactly as generated.
 fn mixed_flow(n: usize, seed: u64) -> (Engine, Vec<Command>) {
+    let (setup, cmds) = mixed_flow_commands(n, seed);
+    let mut base = Engine::new(InstrumentSpec::default());
+    let mut out = Vec::new();
+    for cmd in &setup {
+        out.clear();
+        base.process(cmd, &mut out);
+    }
+    (base, cmds)
+}
+
+/// [`mixed_flow`] as commands only: the `setup` commands that build the
+/// starting book, then the `n`-command stream — to replay into any engine
+/// type (or several instruments).
+fn mixed_flow_commands(n: usize, seed: u64) -> (Vec<Command>, Vec<Command>) {
     let mut rng = Rng::new(seed);
     let mut engine = Engine::new(InstrumentSpec::default());
     let mut live = Live::default();
@@ -81,6 +101,7 @@ fn mixed_flow(n: usize, seed: u64) -> (Engine, Vec<Command>) {
         next_id += 1;
         next_id - 1
     };
+    let mut setup = Vec::new();
     for side in [Side::Buy, Side::Sell] {
         for k in 1..=50i64 {
             let price = if side == Side::Buy { MID - k } else { MID + k };
@@ -89,10 +110,10 @@ fn mixed_flow(n: usize, seed: u64) -> (Engine, Vec<Command>) {
                 out.clear();
                 engine.process(&cmd, &mut out);
                 live.observe(&out, engine.book());
+                setup.push(cmd);
             }
         }
     }
-    let base = engine.clone();
 
     let mut cmds = Vec::with_capacity(n);
     while cmds.len() < n {
@@ -148,7 +169,7 @@ fn mixed_flow(n: usize, seed: u64) -> (Engine, Vec<Command>) {
         live.observe(&out, engine.book());
         cmds.push(cmd);
     }
-    (base, cmds)
+    (setup, cmds)
 }
 
 /// Submit → events latency for one command of the mixed flow.
@@ -274,6 +295,230 @@ fn engine_v1_throughput() -> Report {
     )
 }
 
+// ---------------------------------------------------------------------------
+// Performance weeks (26, 36, 37, 38, 40): the w07 mixed flow through each
+// engine configuration.
+
+/// Commands per second of engines made by `make`, each fed `setup` (the
+/// starting book, ~0.1% of the commands, timed too) then `cmds`.
+fn rate_of<E>(
+    id: &str,
+    label: &str,
+    setup: &[Command],
+    cmds: &[Command],
+    mut make: impl FnMut() -> E,
+    mut process: impl FnMut(&mut E, &Command, &mut Vec<Event>),
+) -> Report {
+    let mut out = Vec::with_capacity(64);
+    benchkit::throughput(
+        id,
+        label,
+        Unit::OpsPerSec,
+        (setup.len() + cmds.len()) as u64,
+        || {
+            let mut engine = make();
+            for cmd in setup.iter().chain(cmds) {
+                process(&mut engine, cmd, &mut out);
+                out.clear();
+            }
+            black_box(&engine);
+        },
+    )
+}
+
+/// Submit → events latency of one command of the mixed flow, for any
+/// engine (the w07.match_latency method).
+fn latency_of<E>(
+    id: &str,
+    label: &str,
+    seed: u64,
+    mut engine: E,
+    mut process: impl FnMut(&mut E, &Command, &mut Vec<Event>),
+) -> Report {
+    const ITER: u64 = 1_000_000;
+    let (setup, cmds) = mixed_flow_commands((ITER + ITER / 10) as usize, seed);
+    let mut out = Vec::with_capacity(64);
+    for cmd in &setup {
+        process(&mut engine, cmd, &mut out);
+        out.clear();
+    }
+    let mut next = cmds.iter();
+    benchkit::latency(
+        id,
+        label,
+        Unit::Ns,
+        ITER,
+        || *next.next().expect("stream long enough"),
+        |cmd| {
+            process(&mut engine, &cmd, &mut out);
+            black_box(&out);
+            out.clear();
+        },
+    )
+}
+
+/// w26: the w07 engine after the profile-guided fixes (sorted-vector price
+/// levels, single-probe passive path), on the w07 flow.
+fn w26_engine_throughput() -> Report {
+    let (setup, cmds) = mixed_flow_commands(1_000_000, 0x2626);
+    rate_of(
+        "w26.engine_throughput",
+        "Engine throughput after profiling fixes",
+        &setup,
+        &cmds,
+        || Engine::new(InstrumentSpec::default()),
+        |e, cmd, out| e.process(cmd, out),
+    )
+}
+
+/// w36: 8 instruments over 4 shards; each command's instrument is uniform
+/// at random (per-instrument w07 flows, interleaved). Router on this
+/// thread, 4 engine threads, batches of 256, a flush every 64k commands.
+fn w36_sharded_throughput() -> Report {
+    const INSTRUMENTS: u32 = 8;
+    const PER: usize = 125_000;
+    let mut rng = Rng::new(0x3636);
+    let mut setup = Vec::new();
+    let mut queues: Vec<std::vec::IntoIter<Command>> = Vec::new();
+    for i in 1..=INSTRUMENTS {
+        let tag = |cmd: Command| -> Command {
+            let remap = |id: OrderId| OrderId(id.0 * 16 + u64::from(i));
+            match cmd {
+                Command::New(mut o) => {
+                    o.id = remap(o.id);
+                    o.instrument = InstrumentId(i);
+                    Command::New(o)
+                }
+                Command::Cancel { id } => Command::Cancel { id: remap(id) },
+                Command::Reduce { id, qty } => Command::Reduce { id: remap(id), qty },
+            }
+        };
+        let (s, c) = mixed_flow_commands(PER, 0x3600 + u64::from(i));
+        setup.extend(s.into_iter().map(tag));
+        queues.push(c.into_iter().map(tag).collect::<Vec<_>>().into_iter());
+    }
+    let mut cmds = setup;
+    let mut remaining: usize = queues.iter().map(|q| q.len()).sum();
+    while remaining > 0 {
+        let q = rng.range(0, u64::from(INSTRUMENTS) - 1) as usize;
+        if let Some(cmd) = queues[q].next() {
+            cmds.push(cmd);
+            remaining -= 1;
+        }
+    }
+    let mut events = Vec::with_capacity(1 << 18);
+    benchkit::throughput(
+        "w36.sharded_throughput",
+        "4 shards, uniform symbols",
+        Unit::OpsPerSec,
+        cmds.len() as u64,
+        || {
+            let mut registry = InstrumentRegistry::new(4);
+            for i in 1..=INSTRUMENTS {
+                let spec = InstrumentSpec {
+                    id: InstrumentId(i),
+                    ..InstrumentSpec::default()
+                };
+                registry.register(spec).expect("fresh registry");
+            }
+            let mut sharded = ShardedEngine::new(registry, 256);
+            for (k, cmd) in cmds.iter().enumerate() {
+                let _ = black_box(sharded.send(cmd));
+                if k % 65_536 == 65_535 {
+                    sharded.flush(&mut events);
+                    events.clear();
+                }
+            }
+            black_box(sharded.shutdown(&mut events).len());
+            events.clear();
+        },
+    )
+}
+
+/// w37: the same flow through `Guarded<Book, MaxOrderQty<_>>` (static
+/// dispatch, inlined) and `DynGuarded` (boxed book, boxed policy), as a
+/// throughput ratio: the median of 5 alternating measurements, so a change
+/// in machine load hits both sides alike.
+fn w37_static_vs_dyn() -> Report {
+    const CAP: u64 = 1_000_000;
+    let (setup, cmds) = mixed_flow_commands(1_000_000, 0x3737);
+    let spec = InstrumentSpec::default();
+    let generic = || {
+        rate_of(
+            "",
+            "",
+            &setup,
+            &cmds,
+            || -> Guarded<Book, MaxOrderQty<CAP>> { Guarded::new(Engine::new(spec), MaxOrderQty) },
+            |e, cmd, out| e.process(cmd, out),
+        )
+        .value
+    };
+    let dynamic = || {
+        rate_of(
+            "",
+            "",
+            &setup,
+            &cmds,
+            || -> DynGuarded {
+                let book: Box<dyn OrderBook> = Box::new(Book::with_capacity(1_024, 256));
+                let risk: Box<dyn RiskPolicy> = Box::new(MaxOrderQty::<CAP>);
+                Guarded::new(Engine::with_book(EngineConfig::new(spec), book), risk)
+            },
+            |e, cmd, out| e.process(cmd, out),
+        )
+        .value
+    };
+    let mut ratios: Vec<f64> = (0..5).map(|_| generic() / dynamic()).collect();
+    ratios.sort_by(f64::total_cmp);
+    benchkit::ratio(
+        "w37.static_vs_dyn",
+        "Generic vs dyn engine",
+        ratios[ratios.len() / 2],
+        1.0,
+    )
+}
+
+/// w38: the hot/cold-split engine (`FastEngine<Book, NoRisk>`).
+fn w38_match_latency() -> Report {
+    let engine: FastEngine<Book, NoRisk> = FastEngine::new(
+        EngineConfig::new(InstrumentSpec::default()),
+        Book::with_capacity(1_024, 256),
+        NoRisk,
+    );
+    latency_of(
+        "w38.match_latency",
+        "Submit→events after hot/cold split",
+        0x3838,
+        engine,
+        |e, cmd, out| e.process(cmd, out),
+    )
+}
+
+/// w40: the fastest configuration ([`fastest_engine`]), throughput.
+fn w40_engine_throughput() -> Report {
+    let (setup, cmds) = mixed_flow_commands(1_000_000, 0x4040);
+    rate_of(
+        "w40.engine_throughput",
+        "Final engine throughput",
+        &setup,
+        &cmds,
+        || fastest_engine(EngineConfig::new(InstrumentSpec::default())),
+        |e, cmd, out| e.process(cmd, out),
+    )
+}
+
+/// w40: the fastest configuration, submit → events latency.
+fn w40_match_latency() -> Report {
+    latency_of(
+        "w40.match_latency",
+        "Final submit→events latency",
+        0x4041,
+        fastest_engine(EngineConfig::new(InstrumentSpec::default())),
+        |e, cmd, out| e.process(cmd, out),
+    )
+}
+
 fn main() {
     benchkit::run(&[
         (
@@ -295,6 +540,36 @@ fn main() {
             "w12.engine_v1_throughput",
             "Engine v1 end to end (journal + match + md)",
             engine_v1_throughput,
+        ),
+        (
+            "w26.engine_throughput",
+            "Engine throughput after profiling fixes",
+            w26_engine_throughput,
+        ),
+        (
+            "w36.sharded_throughput",
+            "4 shards, uniform symbols",
+            w36_sharded_throughput,
+        ),
+        (
+            "w37.static_vs_dyn",
+            "Generic vs dyn engine",
+            w37_static_vs_dyn,
+        ),
+        (
+            "w38.match_latency",
+            "Submit→events after hot/cold split",
+            w38_match_latency,
+        ),
+        (
+            "w40.engine_throughput",
+            "Final engine throughput",
+            w40_engine_throughput,
+        ),
+        (
+            "w40.match_latency",
+            "Final submit→events latency",
+            w40_match_latency,
         ),
     ]);
 }

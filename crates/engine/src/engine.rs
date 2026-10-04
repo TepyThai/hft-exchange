@@ -132,9 +132,53 @@ impl<B: OrderBook> Engine<B> {
     ///
     /// Events: `Rejected` alone, or `Accepted`, `Trade`*, then `Rested` or
     /// `Expired` if quantity remains.
+    ///
+    /// Cost: a passive GTC limit (the common case) is one id-index probe
+    /// plus the book's add; a taker pays one id probe plus O(1) per trade.
     pub fn submit(&mut self, order: &NewOrder, out: &mut Vec<Event>) {
         self.seq += 1;
-        if let Err(reason) = self.validate(order) {
+        if let Err(reason) = self.check_spec(order) {
+            out.push(Event::Rejected {
+                id: order.id,
+                reason,
+            });
+            return;
+        }
+        // Passive fast path (w26). A GTC limit that does not cross the
+        // opposite best cannot trade, so of the book checks only
+        // `DuplicateOrderId` applies (`WouldTake` needs a cross, the others
+        // a market or FOK order) — and `add` makes exactly that check in
+        // the same hash probe that inserts the order. The separate
+        // `contains` probe was ~10% of the engine's profile; dropping it
+        // here saved ~9% of the instructions per command on the w07 flow.
+        if let (OrderKind::Limit { price, .. }, TimeInForce::Gtc) = (order.kind, order.tif) {
+            let opposite = self.book.best(order.side.opposite());
+            if !opposite.is_some_and(|best| order.side.crosses(price, best.price)) {
+                let rest = RestingOrder {
+                    id: order.id,
+                    side: order.side,
+                    price,
+                    qty: order.qty,
+                };
+                match self.book.add(rest) {
+                    Ok(()) => {
+                        out.push(Event::Accepted { id: order.id });
+                        out.push(Event::Rested {
+                            id: order.id,
+                            side: order.side,
+                            price,
+                            qty: order.qty,
+                        });
+                    }
+                    Err(e) => out.push(Event::Rejected {
+                        id: order.id,
+                        reason: e.into(),
+                    }),
+                }
+                return;
+            }
+        }
+        if let Err(reason) = self.check_book(order) {
             out.push(Event::Rejected {
                 id: order.id,
                 reason,
@@ -309,52 +353,8 @@ impl<B: OrderBook> Engine<B> {
     ///
     /// Cost: O(1) plus one id lookup, plus the FOK walk for FOK orders.
     pub fn validate(&self, order: &NewOrder) -> Result<(), RejectReason> {
-        let spec = &self.config.spec;
-        if order.qty.is_zero() {
-            return Err(RejectReason::ZeroQuantity);
-        }
-        if !order.qty.0.is_multiple_of(spec.lot) {
-            return Err(RejectReason::InvalidLot);
-        }
-        if let OrderKind::Limit { price, .. } = order.kind {
-            if price.0.rem_euclid(spec.tick) != 0 {
-                return Err(RejectReason::InvalidTick);
-            }
-            if spec.band_ticks > 0 {
-                if let Some(reference) = self.reference_price() {
-                    let max = (spec.band_ticks as u64).saturating_mul(spec.tick as u64);
-                    if price.0.abs_diff(reference.0) > max {
-                        return Err(RejectReason::PriceBand);
-                    }
-                }
-            }
-        }
-        if self.book.contains(order.id) {
-            return Err(RejectReason::DuplicateOrderId);
-        }
-        let opposite = self.book.best(order.side.opposite());
-        match order.kind {
-            OrderKind::Limit {
-                price,
-                post_only: true,
-            } => {
-                if opposite.is_some_and(|best| order.side.crosses(price, best.price)) {
-                    return Err(RejectReason::WouldTake);
-                }
-            }
-            OrderKind::Market => {
-                if opposite.is_none() {
-                    return Err(RejectReason::NoLiquidity);
-                }
-            }
-            OrderKind::Limit { .. } => {}
-        }
-        if order.tif == TimeInForce::Fok
-            && self.fillable(order.side, order.limit_price(), order.qty) < order.qty
-        {
-            return Err(RejectReason::FokUnfillable);
-        }
-        Ok(())
+        self.check_spec(order)?;
+        self.check_book(order)
     }
 
     /// The band reference price: the last trade, or the configured
@@ -385,3 +385,70 @@ impl<B: OrderBook> Engine<B> {
         got.min(want)
     }
 }
+
+// @student-begin w26
+/// `validate` in two halves, so `submit` can run the book half only where
+/// it is needed (its passive fast path makes the duplicate check inside
+/// `add`).
+impl<B: OrderBook> Engine<B> {
+    /// The checks on the message alone (`ZeroQuantity`, `InvalidLot`,
+    /// `InvalidTick`, `PriceBand`), in order. O(1).
+    #[inline]
+    fn check_spec(&self, order: &NewOrder) -> Result<(), RejectReason> {
+        let spec = &self.config.spec;
+        if order.qty.is_zero() {
+            return Err(RejectReason::ZeroQuantity);
+        }
+        if !order.qty.0.is_multiple_of(spec.lot) {
+            return Err(RejectReason::InvalidLot);
+        }
+        if let OrderKind::Limit { price, .. } = order.kind {
+            if price.0.rem_euclid(spec.tick) != 0 {
+                return Err(RejectReason::InvalidTick);
+            }
+            if spec.band_ticks > 0 {
+                if let Some(reference) = self.reference_price() {
+                    let max = (spec.band_ticks as u64).saturating_mul(spec.tick as u64);
+                    if price.0.abs_diff(reference.0) > max {
+                        return Err(RejectReason::PriceBand);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The checks against the book (`DuplicateOrderId`, `WouldTake`,
+    /// `NoLiquidity`, `FokUnfillable`), in order, for an order that passed
+    /// [`check_spec`](Self::check_spec). One id probe, plus the FOK walk.
+    #[inline]
+    fn check_book(&self, order: &NewOrder) -> Result<(), RejectReason> {
+        if self.book.contains(order.id) {
+            return Err(RejectReason::DuplicateOrderId);
+        }
+        let opposite = self.book.best(order.side.opposite());
+        match order.kind {
+            OrderKind::Limit {
+                price,
+                post_only: true,
+            } => {
+                if opposite.is_some_and(|best| order.side.crosses(price, best.price)) {
+                    return Err(RejectReason::WouldTake);
+                }
+            }
+            OrderKind::Market => {
+                if opposite.is_none() {
+                    return Err(RejectReason::NoLiquidity);
+                }
+            }
+            OrderKind::Limit { .. } => {}
+        }
+        if order.tif == TimeInForce::Fok
+            && self.fillable(order.side, order.limit_price(), order.qty) < order.qty
+        {
+            return Err(RejectReason::FokUnfillable);
+        }
+        Ok(())
+    }
+}
+// @student-end

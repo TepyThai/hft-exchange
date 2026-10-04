@@ -8,6 +8,8 @@ license.workspace = true
 [dependencies]
 types = { workspace = true }
 book = { workspace = true }
+# w37: the w15 pre-trade risk engine as a `RiskPolicy`.
+risk = { workspace = true }
 # `journal` and `marketdata` join in w12 (engine v1 wiring); they are not
 # used by the matching core.
 

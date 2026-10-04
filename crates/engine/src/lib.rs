@@ -86,8 +86,9 @@
 //!
 //! Events go into the caller's `Vec` (reuse it and clear it between
 //! commands); the trade tape is a fixed ring. Once the book has grown to its
-//! peak size, a command allocates nothing, except a `BTreeMap` node when the
-//! w06 book opens a new price level (w27 removes that).
+//! peak size, a command allocates nothing (w26 removed the last source, the
+//! B-tree nodes of the w06 book's price levels; the w27 slab book needs no
+//! warm-up at all).
 //!
 //! # Weeks
 //!
@@ -96,16 +97,37 @@
 //!   tick/lot/band validation.
 //! * w12 — [`testkit`]: order-stream generator, invariant checker, naive
 //!   reference matcher, differential testing and shrinking.
+//! * w26 — profiling: the hot path of [`Engine::submit`] (a passive order
+//!   is one id probe) and the w06 book's price index; the w26 tests pin
+//!   the properties (no allocation in steady state, unchanged events).
+//! * w36 — [`ShardedEngine`]: [`InstrumentRegistry`], a router sharding
+//!   instruments over engine threads, per-shard sequence numbers.
+//! * w37 — [`RiskPolicy`] and [`Guarded`]: the order path generic over
+//!   book and risk policy (vs [`DynGuarded`]); [`TapeRing`], a
+//!   const-generic trade tape.
+//! * w38 — [`FastEngine`]: the engine restructured into a hot path and
+//!   cold (`#[cold]`, out-of-line) rejects and rare order types.
+//! * w40 — [`perf`]: the fastest configuration and a regression check
+//!   between two benchmark reports.
 
 mod engine;
+mod fast;
 mod hash;
+pub mod perf;
+mod policy;
+mod shard;
 mod snapshot;
 mod tape;
 pub mod testkit;
 
 pub use engine::{Engine, EngineConfig};
+pub use fast::{reject_slot, FastEngine, REJECT_KINDS};
 pub use hash::StateHasher;
+pub use policy::{DynGuarded, Guarded, MaxOrderQty, NoRisk, RiskPolicy, TapeIter, TapeRing};
+pub use shard::{
+    InstrumentRegistry, RegistryError, RouteError, ShardEvent, ShardId, ShardedEngine,
+};
 pub use snapshot::BookSnapshot;
 pub use tape::{TradePrint, TradeTape};
 
-pub use book::{Book, LevelInfo, OrderBook, RestingOrder};
+pub use book::{Book, LadderBook, LevelInfo, OrderBook, RestingOrder, SlabBook};
