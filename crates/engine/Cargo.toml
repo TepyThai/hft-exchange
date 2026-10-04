@@ -8,8 +8,8 @@ license.workspace = true
 [dependencies]
 types = { workspace = true }
 book = { workspace = true }
-journal = { workspace = true }
-marketdata = { workspace = true }
+# `journal` and `marketdata` join in w12 (engine v1 wiring); they are not
+# used by the matching core.
 
 [dev-dependencies]
 benchkit = { workspace = true }
