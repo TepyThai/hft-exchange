@@ -324,8 +324,7 @@ pub fn strip_source(src: &str) -> Result<(String, usize), String> {
     let mut out = src.to_string();
     let mut count = 0;
     // Process from the bottom so earlier byte offsets stay valid.
-    loop {
-        let Some((marker_start, marker_end, week, region)) = last_marker(&out) else { break };
+    while let Some((marker_start, marker_end, week, region)) = last_marker(&out) {
         let b = out.as_bytes();
         if region {
             let end_tag = "// @student-end";
@@ -388,8 +387,7 @@ pub fn strip_source(src: &str) -> Result<(String, usize), String> {
 fn strip_impl_bodies(inner: &str, week: &str) -> Result<String, String> {
     let mut out = inner.to_string();
     let mut search = 0;
-    loop {
-        let Some(rel) = find_fn_keyword(&out[search..]) else { break };
+    while let Some(rel) = find_fn_keyword(&out[search..]) {
         let fn_pos = search + rel;
         let b = out.as_bytes();
         let Some(open) = body_open(b, fn_pos) else {

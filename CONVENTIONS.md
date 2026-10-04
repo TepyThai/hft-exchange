@@ -81,5 +81,7 @@ Rules that keep the template compiling (`cargo xtask strip --check`):
   comment, and with a safe version or a test that exercises it under the
   same conditions.
 * No external dependencies except where the week needs them (`tokio` for the
-  gateway, `wasm-bindgen` for the wasm crate). Ask before adding one.
+  gateway). Ask before adding one. The wasm crate uses a plain C ABI, and
+  `apps/terminal` (GPUI) is a separate workspace, so neither adds
+  dependencies to the curriculum crates.
 * `cargo clippy --workspace --all-targets` clean; `cargo fmt`.

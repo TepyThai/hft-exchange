@@ -25,6 +25,7 @@ networking), and finally strategies, backtesting and a live demo.
 | `sim` | Simulated traders, strategies, backtesting, fault injection |
 | `demo`, `wasm` | The deployable demo and the in-browser engine |
 | `benchkit`, `xtask` | Measurement harness and tooling (provided) |
+| `apps/terminal` | A native trading terminal over your engine (GPUI) |
 
 ## How it works
 
@@ -52,6 +53,19 @@ cargo xtask report --upload    # send results to your tepy.dev dashboard
 The lab shows which weeks pass, your latency histograms and throughput over
 time, and flags regressions. Week pages flip their capstone requirements
 automatically from your latest report.
+
+## See your engine trade
+
+Once weeks 6–8 pass, your engine can drive two front ends. Both run it with simulated order flow (`sim::flow`) and let you trade against that flow:
+
+* **In the browser.** `cargo xtask wasm` builds `crates/wasm` into a 60-odd KiB WebAssembly module, the same one [tepy.dev/hft/live](https://tepy.dev/hft/live) runs.
+* **Native.** [`apps/terminal`](apps/terminal) is a GPU-rendered trading terminal built with [GPUI](https://www.gpui.rs/). It has an order book ladder, candles, depth, a live per-command latency histogram of your engine, and order entry.
+
+  ```sh
+  cd apps/terminal && cargo run --release
+  ```
+
+![hft-terminal](apps/terminal/screenshot.png)
 
 ## Branches
 
