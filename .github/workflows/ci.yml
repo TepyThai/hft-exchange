@@ -22,13 +22,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # Week tests (and optionally benchmarks) → hft-report.json. Failing
-      # week tests are progress, not a CI failure; only a build error fails.
-      - name: Run week tests
-        run: cargo xtask report --source ci ${{ inputs.bench != true && '--no-bench' || '' }}
-      - name: Upload report to tepy.dev
-        if: env.TEPY_TOKEN != ''
-        run: cargo xtask report --source ci --no-bench --upload
+      # Week tests (and optionally benchmarks) → hft-report.json, uploaded
+      # to tepy.dev when the TEPY_TOKEN secret is set. Failing week tests are
+      # progress, not a CI failure; only a build error fails the job.
+      - name: Run week tests and report
+        run: cargo xtask report --source ci ${{ inputs.bench != true && '--no-bench' || '' }} $([ -n "$TEPY_TOKEN" ] && echo --upload)
       - uses: actions/upload-artifact@v4
         with:
           name: hft-report
