@@ -113,6 +113,7 @@ name = "telemetry"
 version = "0.1.0"
 dependencies = [
  "benchkit",
+ "types",
 ]
 
 [[package]]
